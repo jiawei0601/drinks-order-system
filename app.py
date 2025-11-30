@@ -46,16 +46,7 @@ def get_google_sheet_data():
     
     # 連線
     client = gspread.authorize(creds)
-    
-    # 開啟試算表 (透過網址)
-    # 嘗試從 Secrets 讀取網址，如果沒有則使用預設提示
-    sheet_url = s_info.get("spreadsheet")
-    if not sheet_url:
-        st.error("❌ Secrets 中缺少 'spreadsheet' 網址設定。請在 Secrets 中加入 spreadsheet = '...您的網址...'")
-        st.stop()
-        
-    sheet = client.open_by_url(sheet_url).sheet1
-    return sheet
+    return client, s_info
 
 # ==========================================
 # 2. 菜單資料庫
@@ -81,6 +72,16 @@ ICE_OPTS = ["正常冰", "少冰", "微冰", "去冰", "常溫", "熱"]
 # 3. 網頁介面
 # ==========================================
 st.title("🥤 辦公室飲料點餐系統")
+
+# 嘗試連線取得機器人資訊 (為了顯示 Email 給使用者看)
+try:
+    client, s_info = get_google_sheet_data()
+    bot_email = s_info['client_email']
+    # 在側邊欄顯示機器人資訊，方便除錯
+    st.sidebar.info(f"🤖 **機器人帳號：**\n\n`{bot_email}`\n\n(請確認已將試算表共用給這個 Email)")
+except Exception as e:
+    st.error(f"連線設定有誤：{e}")
+    st.stop()
 
 st.sidebar.header("設定")
 selected_store = st.sidebar.selectbox("今天喝哪一家？", list(ALL_MENUS.keys()))
@@ -115,15 +116,33 @@ if submitted:
             order_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             row_data = [order_time, selected_store, name, drink, price, sugar, ice, note]
 
-            # 連線並寫入 (使用 gspread 直接 append_row，速度更快更穩)
-            sheet = get_google_sheet_data()
+            # 取得試算表網址
+            sheet_url = s_info.get("spreadsheet")
+            if not sheet_url:
+                st.error("❌ Secrets 中缺少 'spreadsheet' 設定。")
+                st.stop()
+
+            # 開啟試算表
+            spreadsheet = client.open_by_url(sheet_url)
+            sheet = spreadsheet.get_worksheet(0) # 寫入第一頁
+            
+            # 寫入資料
             sheet.append_row(row_data)
             
             st.success(f"✅ {name} 點餐成功！")
             st.balloons()
             
         except Exception as e:
-            st.error(f"⚠️ 寫入失敗：{e}")
+            error_msg = str(e)
+            st.error(f"⚠️ 寫入失敗：{error_msg}")
+            
+            # 智慧錯誤分析
+            if "403" in error_msg or "permission" in error_msg.lower():
+                st.warning(f"🚨 **權限錯誤！**\n請複製側邊欄那個 `iam.gserviceaccount.com` 的 Email，\n去您的 Google 試算表按「共用」，把它加為「編輯者」。")
+            elif "404" in error_msg or "not found" in error_msg.lower():
+                st.warning("🚨 **找不到試算表！**\n請確認 Secrets 裡的網址是否正確，且您已將試算表共用給機器人。")
+            elif "API has not been used" in error_msg:
+                st.warning("🚨 **API 未啟用！**\n請去 Google Cloud Console 啟用 Google Sheets API。")
 
 # ==========================================
 # 5. 顯示目前清單
@@ -131,12 +150,14 @@ if submitted:
 st.divider()
 st.write("📊 **目前訂單列表：**")
 try:
-    sheet = get_google_sheet_data()
-    # 讀取所有紀錄並轉成 DataFrame 顯示
-    data = sheet.get_all_records()
-    if data:
-        st.dataframe(pd.DataFrame(data))
-    else:
-        st.info("目前沒有資料")
+    sheet_url = s_info.get("spreadsheet")
+    if sheet_url:
+        spreadsheet = client.open_by_url(sheet_url)
+        sheet = spreadsheet.get_worksheet(0)
+        data = sheet.get_all_records()
+        if data:
+            st.dataframe(pd.DataFrame(data))
+        else:
+            st.info("目前沒有資料")
 except Exception as e:
-    st.info("尚無訂單或連線設定中...")
+    st.info("等待訂單中...")
