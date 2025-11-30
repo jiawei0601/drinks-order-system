@@ -21,25 +21,16 @@ from io import BytesIO
 # ==========================================
 @st.cache_resource
 def setup_chinese_font():
-    # 改用一個通用的檔名，並優先使用穩定性較高的 Open Huninn 字型
     font_path = "chinese_font.ttf"
-    
-    # 來源 1: Open Huninn (粉圓體) - GitHub Raw 連結通常較穩定
     url_primary = "https://raw.githubusercontent.com/justfont/open-huninn-font/master/font/jf-openhuninn-1.1.ttf"
-    
-    # 來源 2: Google Noto Sans TC (備用) - 使用 Variable Font 版本
     url_backup = "https://github.com/google/fonts/raw/main/ofl/notosanstc/NotoSansTC%5Bwght%5D.ttf"
     
-    # 下載函式 (包含防呆檢查)
     def download_font(url):
         try:
             response = requests.get(url, timeout=15)
             if response.status_code == 200:
-                # 檢查內容是否為有效的二進位檔 (避免下載到 HTML 錯誤頁面)
-                # 0x0A 是換行符號，如果開頭都是換行或 < (HTML)，代表下載錯了
                 if len(response.content) < 1000 or response.content.startswith(b"<") or response.content.startswith(b"\n"):
                     return False
-                
                 with open(font_path, "wb") as f:
                     f.write(response.content)
                 return True
@@ -47,23 +38,16 @@ def setup_chinese_font():
         except:
             return False
 
-    # 如果檔案不存在，才下載
     if not os.path.exists(font_path):
         with st.spinner("正在下載中文字型以支援 PDF (第一次需約 10 秒)..."):
-            # 先試主要連結
             if not download_font(url_primary):
-                # 失敗則試備用連結
                 if not download_font(url_backup):
                     st.error("⚠️ 無法下載中文字型，PDF 報表可能會顯示亂碼。")
                     return None
-    
-    # 註冊字型
     try:
-        # 使用 'ChineseFont' 作為註冊名稱
         pdfmetrics.registerFont(TTFont('ChineseFont', font_path))
         return 'ChineseFont'
     except Exception as e:
-        # 如果註冊失敗（例如檔案損壞），刪除檔案以便下次重試
         if os.path.exists(font_path):
             os.remove(font_path)
         st.warning(f"字型載入異常 ({e})，請重新整理頁面試試。")
@@ -78,7 +62,6 @@ def get_google_sheet_data():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
-    
     try:
         if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
             s_info = st.secrets["connections"]["gsheets"]
@@ -116,8 +99,10 @@ def get_google_sheet_data():
         st.stop()
 
 # ==========================================
-# 2. 菜單讀取 (支援大小杯)
+# 2. 資料讀取 (菜單 & 訂單) - 含快取機制
 # ==========================================
+
+# 讀取菜單 (快取 60 秒)
 @st.cache_data(ttl=60)
 def load_menu_from_sheet(_client, sheet_url):
     try:
@@ -161,6 +146,16 @@ def load_menu_from_sheet(_client, sheet_url):
     except Exception as e:
         return None, str(e)
 
+# 讀取訂單 (快取 5 秒，避免輸入時瘋狂刷 API 導致 429 錯誤)
+@st.cache_data(ttl=5)
+def get_orders_from_sheet(_client, sheet_url):
+    try:
+        spreadsheet = _client.open_by_url(sheet_url)
+        sheet = spreadsheet.get_worksheet(0)
+        return sheet.get_all_values()
+    except Exception:
+        return []
+
 # ==========================================
 # 3. PDF 生成函式
 # ==========================================
@@ -169,34 +164,25 @@ def generate_pdf_report(df, total_amount):
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     elements = []
     
-    # 註冊中文字型
     font_name = setup_chinese_font()
     if not font_name:
-        font_name = 'Helvetica' # 備用字型(不支援中文)
+        font_name = 'Helvetica'
 
-    # 定義樣式
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle('Title', parent=styles['Title'], fontName=font_name, fontSize=20, leading=24)
     normal_style = ParagraphStyle('Normal', parent=styles['Normal'], fontName=font_name, fontSize=12, leading=16)
     
-    # 標題
     today = datetime.now().strftime("%Y-%m-%d")
     elements.append(Paragraph(f"飲料訂購結算單 ({today})", title_style))
     elements.append(Spacer(1, 12))
-    
-    # 總金額
     elements.append(Paragraph(f"今日總營業額：{total_amount} 元", normal_style))
     elements.append(Spacer(1, 12))
     
-    # 轉換 DataFrame 為列表資料 (用於表格)
-    # 選取要顯示的欄位
     display_cols = ['時間', '姓名', '品項', '大小', '甜度', '冰塊', '價格', '備註']
-    # 確保欄位存在
     cols = [c for c in display_cols if c in df.columns]
     
     data = [cols] + df[cols].values.tolist()
     
-    # 建立表格
     t = Table(data)
     t.setStyle(TableStyle([
         ('FONTNAME', (0, 0), (-1, -1), font_name),
@@ -280,13 +266,17 @@ if st.button("送出訂單", type="primary"):
             spreadsheet = client.open_by_url(sheet_url)
             sheet = spreadsheet.get_worksheet(0) 
             sheet.append_row(row_data)
+            
+            # 重要：清除訂單快取，讓新訂單馬上顯示
+            get_orders_from_sheet.clear()
+            
             st.success(f"✅ {name} 點餐成功！")
             st.balloons()
         except Exception as e:
             st.error(f"⚠️ 寫入失敗：{e}")
 
 # ==========================================
-# 5. 管理員結算專區 (PDF與清空功能)
+# 5. 管理員結算專區
 # ==========================================
 st.sidebar.divider()
 st.sidebar.header("👮‍♂️ 管理員專區")
@@ -298,35 +288,27 @@ if st.sidebar.checkbox("開啟結算功能"):
     try:
         if s_info:
             sheet_url = s_info.get("spreadsheet")
-            spreadsheet = client.open_by_url(sheet_url)
-            sheet = spreadsheet.get_worksheet(0)
             
-            # 使用 get_all_values() 讀取所有資料
-            all_values = sheet.get_all_values()
+            # 改用快取函式讀取資料
+            all_values = get_orders_from_sheet(client, sheet_url)
             
             if len(all_values) > 1:
                 headers = all_values[0]
                 rows = all_values[1:]
                 
-                # --- 修正：過濾掉空的標題欄位 ---
-                # 找出標題不為空的索引
                 valid_indices = [i for i, h in enumerate(headers) if h.strip()]
                 
                 if not valid_indices:
                     st.warning("⚠️ 讀取失敗：找不到任何有效的欄位標題。")
                 else:
-                    # 只保留有效欄位的標題和資料
                     clean_headers = [headers[i] for i in valid_indices]
                     clean_rows = []
                     for row in rows:
-                        # 確保 row 的長度足夠，不足補空字串
                         clean_row = [row[i] if i < len(row) else "" for i in valid_indices]
                         clean_rows.append(clean_row)
                     
-                    # 建立 DataFrame
                     df = pd.DataFrame(clean_rows, columns=clean_headers)
                     
-                    # 計算金額
                     total_amount = 0
                     if '價格' in df.columns:
                         total_amount = pd.to_numeric(df['價格'], errors='coerce').fillna(0).sum()
@@ -336,7 +318,6 @@ if st.sidebar.checkbox("開啟結算功能"):
                     st.metric("💵 今日總營業額", f"{int(total_amount)} 元")
                     st.dataframe(df)
                     
-                    # --- PDF 下載按鈕 ---
                     pdf_bytes = generate_pdf_report(df, int(total_amount))
                     st.download_button(
                         label="📄 下載 PDF 結算單",
@@ -348,12 +329,17 @@ if st.sidebar.checkbox("開啟結算功能"):
                     st.write("---")
                     st.warning("⚠️ **危險操作區**")
                     
-                    # --- 清空儲存格按鈕 ---
                     if st.button("🗑️ 清空所有訂單 (歸零)"):
                         try:
                             standard_headers = ['時間', '店家', '姓名', '品項', '大小', '價格', '甜度', '冰塊', '備註']
+                            spreadsheet = client.open_by_url(sheet_url)
+                            sheet = spreadsheet.get_worksheet(0)
                             sheet.clear()
                             sheet.append_row(standard_headers)
+                            
+                            # 重要：清除快取
+                            get_orders_from_sheet.clear()
+                            
                             st.success("✅ 資料已清空，可以開始新的一天了！")
                             st.rerun()
                         except Exception as e:
@@ -364,23 +350,20 @@ if st.sidebar.checkbox("開啟結算功能"):
         st.error(f"讀取資料失敗：{e}")
 
 # ==========================================
-# 6. 訂單列表
+# 6. 訂單列表 (常駐顯示)
 # ==========================================
 st.divider()
 st.write("📊 **目前訂單列表：**")
 try:
     if s_info:
         sheet_url = s_info.get("spreadsheet")
-        spreadsheet = client.open_by_url(sheet_url)
-        sheet = spreadsheet.get_worksheet(0)
-        
-        all_values = sheet.get_all_values()
+        # 改用快取函式讀取資料
+        all_values = get_orders_from_sheet(client, sheet_url)
         
         if len(all_values) > 1:
             headers = all_values[0]
             rows = all_values[1:]
             
-            # --- 修正：同樣過濾掉空的標題欄位 ---
             valid_indices = [i for i, h in enumerate(headers) if h.strip()]
             if valid_indices:
                 clean_headers = [headers[i] for i in valid_indices]
