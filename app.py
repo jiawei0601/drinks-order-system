@@ -18,16 +18,14 @@ def get_google_sheet_data():
     
     try:
         # --- 1. 取得 Secrets 資料 ---
-        # 優先檢查標準位置 [connections.gsheets]
         if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
             s_info = st.secrets["connections"]["gsheets"]
-        # 次要檢查根目錄 (直接貼 JSON)
         elif "type" in st.secrets and "project_id" in st.secrets:
             s_info = st.secrets
         else:
             raise ValueError("找不到憑證！請確認 Secrets 設定中包含 [connections.gsheets] 區塊。")
 
-        # --- 2. 處理 Private Key 格式問題 (關鍵) ---
+        # --- 2. 處理 Private Key 格式問題 ---
         private_key = s_info["private_key"]
         if "\\n" in private_key:
             private_key = private_key.replace("\\n", "\n")
@@ -60,67 +58,96 @@ def get_google_sheet_data():
         st.stop()
 
 # ==========================================
-# 2. 菜單資料庫
+# 2. 讀取雲端菜單 (新增功能)
 # ==========================================
-ALL_MENUS = {
-    "可不可熟成紅茶": {
-        "熟成紅茶": 30, "鴉片紅茶": 30, "太妃紅茶": 35,
-        "熟成冷露": 30, "白玉歐蕾": 50, "春梅冰茶": 45
-    },
-    "50嵐": {
-        "四季春青茶": 30, "黃金烏龍": 30, "珍珠奶茶": 50,
-        "波霸奶茶": 50, "紅茶拿鐵": 55, "8冰綠": 50
-    },
-    "迷客夏": {
-        "大正紅茶拿鐵": 60, "伯爵紅茶拿鐵": 60, "珍珠紅茶拿鐵": 65,
-        "柳丁綠茶": 60, "芋頭鮮奶": 65
+# 設定 TTL=60 秒，代表菜單更新後，網頁約 1 分鐘後會抓到新資料
+@st.cache_data(ttl=60)
+def load_menu_from_sheet(_client, sheet_url):
+    try:
+        spreadsheet = _client.open_by_url(sheet_url)
+        # 嘗試讀取名為 "菜單設定" 的分頁
+        try:
+            worksheet = spreadsheet.worksheet("菜單設定")
+        except gspread.WorksheetNotFound:
+            return None, "找不到「菜單設定」分頁"
+            
+        records = worksheet.get_all_records()
+        
+        # 將資料轉換成程式需要的格式: {店家: {品項: 價格}}
+        cloud_menus = {}
+        for row in records:
+            store = str(row.get("店家", "")).strip()
+            item = str(row.get("品項", "")).strip()
+            price_raw = row.get("價格", 0)
+            
+            if store and item:
+                if store not in cloud_menus:
+                    cloud_menus[store] = {}
+                try:
+                    cloud_menus[store][item] = int(price_raw)
+                except:
+                    cloud_menus[store][item] = 0
+                    
+        if not cloud_menus:
+            return None, "菜單分頁是空的"
+            
+        return cloud_menus, None
+
+    except Exception as e:
+        return None, str(e)
+
+
+# ==========================================
+# 3. 預設備用菜單 (當雲端讀不到時使用)
+# ==========================================
+DEFAULT_MENUS = {
+    "範例店家(未設定雲端菜單)": {
+        "測試紅茶": 30, "測試綠茶": 30
     }
 }
+
 SUGAR_OPTS = ["正常糖", "少糖 (8分)", "半糖 (5分)", "微糖 (3分)", "一分糖", "無糖"]
 ICE_OPTS = ["正常冰", "少冰", "微冰", "去冰", "常溫", "熱"]
 
 # ==========================================
-# 3. 網頁介面
+# 4. 網頁介面
 # ==========================================
 st.title("🥤 辦公室飲料點餐系統")
 
-# --- 側邊欄：連線狀態檢查 (新增功能) ---
-st.sidebar.header("連線狀態")
+# 初始化變數
+client = None
+s_info = None
+current_menus = DEFAULT_MENUS
+
+# --- 連線與資料載入 ---
 try:
     client, s_info = get_google_sheet_data()
-    bot_email = s_info['client_email']
     sheet_url = s_info.get("spreadsheet")
+    
+    # 嘗試讀取雲端菜單
+    if sheet_url:
+        cloud_menus, error_msg = load_menu_from_sheet(client, sheet_url)
+        if cloud_menus:
+            current_menus = cloud_menus
+            st.toast("✅ 雲端菜單更新成功！")
+        else:
+            # 讀取失敗時顯示提示 (在側邊欄)
+            st.sidebar.warning(f"⚠️ 使用預設菜單 ({error_msg})")
+            st.sidebar.info("💡 **如何啟用雲端菜單？**\n\n請在您的 Google 試算表中新增一個分頁，名稱改為 `菜單設定`，並建立三欄：`店家`、`品項`、`價格`。")
 
-    # 檢查 1: 機器人 Email
-    st.sidebar.info(f"🤖 **機器人帳號：**\n\n`{bot_email}`")
-
-    # 檢查 2: 試算表網址檢查 (防呆)
-    if not sheet_url:
-        st.sidebar.error("❌ 未設定 spreadsheet 網址")
-        st.error("請在 Secrets 中加入 `spreadsheet = '您的網址'`")
-        st.stop()
-    elif "您的試算表ID" in sheet_url:
-        st.sidebar.error("❌ 網址為範例預設值")
-        st.error("🚨 **設定錯誤！**\n\n您在 Secrets 裡的 `spreadsheet` 還是範例文字。\n請去 Streamlit Cloud Settings -> Secrets，把網址改成您真正的 Google 試算表網址。")
-        st.stop()
-    else:
-        # 檢查 3: 嘗試實際連線
-        try:
-            spreadsheet = client.open_by_url(sheet_url)
-            sheet = spreadsheet.get_worksheet(0)
-            st.sidebar.success(f"✅ 已連線到試算表：\n{spreadsheet.title}")
-        except Exception as conn_err:
-            st.sidebar.error("❌ 無法開啟試算表")
-            st.sidebar.warning("請確認已將試算表「共用」給機器人，並設為「編輯者」。")
-            
 except Exception as e:
-    st.sidebar.error(f"連線設定有誤")
+    st.sidebar.error(f"連線異常")
+
+
+st.sidebar.header("點餐設定")
+
+# 如果沒有菜單資料 (全空)
+if not current_menus:
+    st.error("❌ 無法載入任何菜單，請檢查 Google Sheet 設定。")
     st.stop()
 
-st.sidebar.divider()
-st.sidebar.header("點餐設定")
-selected_store = st.sidebar.selectbox("今天喝哪一家？", list(ALL_MENUS.keys()))
-current_menu = ALL_MENUS[selected_store]
+selected_store = st.sidebar.selectbox("今天喝哪一家？", list(current_menus.keys()))
+current_menu_items = current_menus[selected_store]
 st.subheader(f"目前店家：{selected_store}")
 
 with st.form("order_form"):
@@ -128,7 +155,7 @@ with st.form("order_form"):
     with col1:
         name = st.text_input("你的名字 (必填)")
     with col2:
-        drink = st.selectbox("飲料品項", list(current_menu.keys()))
+        drink = st.selectbox("飲料品項", list(current_menu_items.keys()))
     col3, col4 = st.columns(2)
     with col3:
         sugar = st.selectbox("甜度", SUGAR_OPTS)
@@ -139,7 +166,7 @@ with st.form("order_form"):
     submitted = st.form_submit_button("送出訂單")
 
 # ==========================================
-# 4. 邏輯處理
+# 5. 送出訂單邏輯
 # ==========================================
 if submitted:
     if not name:
@@ -147,37 +174,33 @@ if submitted:
     else:
         try:
             # 準備資料
-            price = current_menu[drink]
+            price = current_menu_items[drink]
             order_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             row_data = [order_time, selected_store, name, drink, price, sugar, ice, note]
 
-            # 直接使用上方檢查過的變數
-            spreadsheet = client.open_by_url(sheet_url)
-            sheet = spreadsheet.get_worksheet(0) # 寫入第一頁
-            
             # 寫入資料
+            sheet_url = s_info.get("spreadsheet")
+            spreadsheet = client.open_by_url(sheet_url)
+            # 嘗試寫入第一個分頁 (通常是訂單紀錄頁)
+            # 建議把「菜單設定」放在第二頁，讓第一頁專門存訂單
+            sheet = spreadsheet.get_worksheet(0) 
+            
             sheet.append_row(row_data)
             
             st.success(f"✅ {name} 點餐成功！")
             st.balloons()
             
         except Exception as e:
-            error_msg = str(e)
-            st.error(f"⚠️ 寫入失敗：{error_msg}")
-            
-            # 智慧錯誤分析
-            if "403" in error_msg or "permission" in error_msg.lower():
-                st.warning(f"🚨 **權限錯誤！**\n請複製側邊欄的機器人 Email，去 Google 試算表按「共用」，把它加為「編輯者」。")
-            elif "404" in error_msg or "not found" in error_msg.lower():
-                st.warning("🚨 **找不到試算表！**\n請確認 Secrets 裡的網址是否正確。")
+            st.error(f"⚠️ 寫入失敗：{e}")
 
 # ==========================================
-# 5. 顯示目前清單
+# 6. 顯示訂單列表
 # ==========================================
 st.divider()
 st.write("📊 **目前訂單列表：**")
 try:
-    if sheet_url and "您的試算表ID" not in sheet_url:
+    if s_info:
+        sheet_url = s_info.get("spreadsheet")
         spreadsheet = client.open_by_url(sheet_url)
         sheet = spreadsheet.get_worksheet(0)
         data = sheet.get_all_records()
@@ -185,5 +208,5 @@ try:
             st.dataframe(pd.DataFrame(data))
         else:
             st.info("目前沒有資料")
-except Exception as e:
-    st.info("等待訂單中...")
+except:
+    pass
