@@ -22,21 +22,47 @@ from io import BytesIO
 @st.cache_resource
 def setup_chinese_font():
     font_path = "NotoSansTC-Regular.ttf"
-    # 使用 Google Fonts 的開源字型
-    font_url = "https://github.com/google/fonts/raw/main/ofl/notosanstc/NotoSansTC-Regular.ttf"
     
+    # 嘗試 1: Google Noto Sans TC (修正後的穩定連結)
+    url_primary = "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanstc/static/NotoSansTC-Regular.ttf"
+    
+    # 嘗試 2: Open Huninn (備用字型)
+    url_backup = "https://raw.githubusercontent.com/justfont/open-huninn-font/master/font/jf-openhuninn-1.1.ttf"
+    
+    # 如果檔案不存在，才下載
     if not os.path.exists(font_path):
         with st.spinner("正在下載中文字型以支援 PDF..."):
             try:
-                response = requests.get(font_url)
-                with open(font_path, "wb") as f:
-                    f.write(response.content)
+                # 試著下載主要字型
+                response = requests.get(url_primary, timeout=10)
+                if response.status_code == 200:
+                    with open(font_path, "wb") as f:
+                        f.write(response.content)
+                else:
+                    raise Exception("Primary font download failed")
             except:
-                st.error("無法下載字型，PDF 中文可能會變亂碼。")
-                return None
-                
-    pdfmetrics.registerFont(TTFont('NotoSansTC', font_path))
-    return 'NotoSansTC'
+                try:
+                    # 失敗則嘗試備用字型
+                    response = requests.get(url_backup, timeout=10)
+                    if response.status_code == 200:
+                        with open(font_path, "wb") as f:
+                            f.write(response.content)
+                    else:
+                        st.error("無法下載任何中文字型，PDF 可能會顯示亂碼。")
+                        return None
+                except:
+                    return None
+    
+    # 註冊字型
+    try:
+        pdfmetrics.registerFont(TTFont('NotoSansTC', font_path))
+        return 'NotoSansTC'
+    except Exception as e:
+        st.error(f"字型註冊失敗：{e}。將嘗試刪除損壞的檔案，請重新整理頁面。")
+        # 如果檔案壞了(例如下載到 404 頁面)，刪除它以便下次重試
+        if os.path.exists(font_path):
+            os.remove(font_path)
+        return None
 
 # ==========================================
 # 1. Google Sheets 連線設定
