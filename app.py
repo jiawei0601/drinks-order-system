@@ -170,30 +170,32 @@ selected_store = st.sidebar.selectbox("今天喝哪一家？", list(current_menu
 current_menu_items = current_menus[selected_store]
 st.subheader(f"目前店家：{selected_store}")
 
-with st.form("order_form"):
-    col1, col2 = st.columns(2)
-    with col1:
-        name = st.text_input("你的名字 (必填)")
-    with col2:
-        drink = st.selectbox("飲料品項", list(current_menu_items.keys()))
-        # 取得該飲料的規格與價格表
-        price_dict = current_menu_items[drink]
+# ⚠️ 注意：為了讓價格能即時連動，我們移除了 st.form 表單模式，改用一般輸入
+st.write("---")
+col1, col2 = st.columns(2)
+with col1:
+    name = st.text_input("你的名字 (必填)")
+with col2:
+    drink = st.selectbox("飲料品項", list(current_menu_items.keys()))
+    # 取得該飲料的規格與價格表
+    price_dict = current_menu_items[drink]
 
-    # 改用三欄位佈局，加入大小選擇
-    col3, col4, col5 = st.columns(3)
-    with col3:
-        # 大小選單
-        size = st.selectbox("大小", list(price_dict.keys()))
-        price = price_dict[size]
-        st.caption(f"💰 價格：{price} 元")
-    with col4:
-        sugar = st.selectbox("甜度", SUGAR_OPTS)
-    with col5:
-        ice = st.selectbox("冰塊", ICE_OPTS)
-    
-    note = st.text_input("備註")
-    
-    submitted = st.form_submit_button("送出訂單")
+# 改用三欄位佈局，加入大小選擇
+col3, col4, col5 = st.columns(3)
+with col3:
+    # 大小選單 (選了之後，下方價格會立刻變動)
+    size = st.selectbox("大小", list(price_dict.keys()))
+    price = price_dict[size]
+    st.info(f"💰 價格：**{price}** 元")
+with col4:
+    sugar = st.selectbox("甜度", SUGAR_OPTS)
+with col5:
+    ice = st.selectbox("冰塊", ICE_OPTS)
+
+note = st.text_input("備註")
+
+# 按鈕改為一般按鈕，並加上 type="primary" 比較顯眼
+submitted = st.button("送出訂單", type="primary")
 
 # ==========================================
 # 5. 送出訂單邏輯
