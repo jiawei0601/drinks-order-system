@@ -21,47 +21,52 @@ from io import BytesIO
 # ==========================================
 @st.cache_resource
 def setup_chinese_font():
-    font_path = "NotoSansTC-Regular.ttf"
+    # 改用一個通用的檔名，並優先使用穩定性較高的 Open Huninn 字型
+    font_path = "chinese_font.ttf"
     
-    # 嘗試 1: Google Noto Sans TC (修正後的穩定連結)
-    url_primary = "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanstc/static/NotoSansTC-Regular.ttf"
+    # 來源 1: Open Huninn (粉圓體) - GitHub Raw 連結通常較穩定
+    url_primary = "https://raw.githubusercontent.com/justfont/open-huninn-font/master/font/jf-openhuninn-1.1.ttf"
     
-    # 嘗試 2: Open Huninn (備用字型)
-    url_backup = "https://raw.githubusercontent.com/justfont/open-huninn-font/master/font/jf-openhuninn-1.1.ttf"
+    # 來源 2: Google Noto Sans TC (備用) - 使用 Variable Font 版本
+    url_backup = "https://github.com/google/fonts/raw/main/ofl/notosanstc/NotoSansTC%5Bwght%5D.ttf"
     
+    # 下載函式 (包含防呆檢查)
+    def download_font(url):
+        try:
+            response = requests.get(url, timeout=15)
+            if response.status_code == 200:
+                # 檢查內容是否為有效的二進位檔 (避免下載到 HTML 錯誤頁面)
+                # 0x0A 是換行符號，如果開頭都是換行或 < (HTML)，代表下載錯了
+                if len(response.content) < 1000 or response.content.startswith(b"<") or response.content.startswith(b"\n"):
+                    return False
+                
+                with open(font_path, "wb") as f:
+                    f.write(response.content)
+                return True
+            return False
+        except:
+            return False
+
     # 如果檔案不存在，才下載
     if not os.path.exists(font_path):
-        with st.spinner("正在下載中文字型以支援 PDF..."):
-            try:
-                # 試著下載主要字型
-                response = requests.get(url_primary, timeout=10)
-                if response.status_code == 200:
-                    with open(font_path, "wb") as f:
-                        f.write(response.content)
-                else:
-                    raise Exception("Primary font download failed")
-            except:
-                try:
-                    # 失敗則嘗試備用字型
-                    response = requests.get(url_backup, timeout=10)
-                    if response.status_code == 200:
-                        with open(font_path, "wb") as f:
-                            f.write(response.content)
-                    else:
-                        st.error("無法下載任何中文字型，PDF 可能會顯示亂碼。")
-                        return None
-                except:
+        with st.spinner("正在下載中文字型以支援 PDF (第一次需約 10 秒)..."):
+            # 先試主要連結
+            if not download_font(url_primary):
+                # 失敗則試備用連結
+                if not download_font(url_backup):
+                    st.error("⚠️ 無法下載中文字型，PDF 報表可能會顯示亂碼。")
                     return None
     
     # 註冊字型
     try:
-        pdfmetrics.registerFont(TTFont('NotoSansTC', font_path))
-        return 'NotoSansTC'
+        # 使用 'ChineseFont' 作為註冊名稱
+        pdfmetrics.registerFont(TTFont('ChineseFont', font_path))
+        return 'ChineseFont'
     except Exception as e:
-        st.error(f"字型註冊失敗：{e}。將嘗試刪除損壞的檔案，請重新整理頁面。")
-        # 如果檔案壞了(例如下載到 404 頁面)，刪除它以便下次重試
+        # 如果註冊失敗（例如檔案損壞），刪除檔案以便下次重試
         if os.path.exists(font_path):
             os.remove(font_path)
+        st.warning(f"字型載入異常 ({e})，請重新整理頁面試試。")
         return None
 
 # ==========================================
