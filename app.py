@@ -58,14 +58,12 @@ def get_google_sheet_data():
         st.stop()
 
 # ==========================================
-# 2. 讀取雲端菜單 (新增功能)
+# 2. 讀取雲端菜單 (功能升級：支援大小杯)
 # ==========================================
-# 設定 TTL=60 秒，代表菜單更新後，網頁約 1 分鐘後會抓到新資料
 @st.cache_data(ttl=60)
 def load_menu_from_sheet(_client, sheet_url):
     try:
         spreadsheet = _client.open_by_url(sheet_url)
-        # 嘗試讀取名為 "菜單設定" 的分頁
         try:
             worksheet = spreadsheet.worksheet("菜單設定")
         except gspread.WorksheetNotFound:
@@ -73,20 +71,45 @@ def load_menu_from_sheet(_client, sheet_url):
             
         records = worksheet.get_all_records()
         
-        # 將資料轉換成程式需要的格式: {店家: {品項: 價格}}
+        # 資料格式轉換: {店家: {品項: {規格: 價格}}}
         cloud_menus = {}
         for row in records:
             store = str(row.get("店家", "")).strip()
             item = str(row.get("品項", "")).strip()
-            price_raw = row.get("價格", 0)
+            
+            # 支援多種欄位名稱
+            price_m = row.get("中杯") or row.get("M")
+            price_l = row.get("大杯") or row.get("L")
+            price_single = row.get("價格") # 舊格式相容
             
             if store and item:
                 if store not in cloud_menus:
                     cloud_menus[store] = {}
+                
+                # 建構該品項的價格表
+                item_prices = {}
+                
+                # 嘗試解析中杯
                 try:
-                    cloud_menus[store][item] = int(price_raw)
-                except:
-                    cloud_menus[store][item] = 0
+                    if price_m and int(price_m) > 0: item_prices["中杯"] = int(price_m)
+                except: pass
+                
+                # 嘗試解析大杯
+                try:
+                    if price_l and int(price_l) > 0: item_prices["大杯"] = int(price_l)
+                except: pass
+                
+                # 如果沒有分大小，試試看舊的單一價格
+                if not item_prices:
+                    try:
+                        if price_single and int(price_single) > 0: item_prices["單一規格"] = int(price_single)
+                    except: pass
+                
+                # 如果還是空的，預設為 0
+                if not item_prices:
+                    item_prices = {"單一規格": 0}
+
+                cloud_menus[store][item] = item_prices
                     
         if not cloud_menus:
             return None, "菜單分頁是空的"
@@ -98,11 +121,12 @@ def load_menu_from_sheet(_client, sheet_url):
 
 
 # ==========================================
-# 3. 預設備用菜單 (當雲端讀不到時使用)
+# 3. 預設備用菜單 (更新為含規格結構)
 # ==========================================
 DEFAULT_MENUS = {
     "範例店家(未設定雲端菜單)": {
-        "測試紅茶": 30, "測試綠茶": 30
+        "測試紅茶": {"中杯": 30, "大杯": 35},
+        "測試綠茶": {"單一規格": 30}
     }
 }
 
@@ -114,7 +138,6 @@ ICE_OPTS = ["正常冰", "少冰", "微冰", "去冰", "常溫", "熱"]
 # ==========================================
 st.title("🥤 辦公室飲料點餐系統")
 
-# 初始化變數
 client = None
 s_info = None
 current_menus = DEFAULT_MENUS
@@ -124,16 +147,14 @@ try:
     client, s_info = get_google_sheet_data()
     sheet_url = s_info.get("spreadsheet")
     
-    # 嘗試讀取雲端菜單
     if sheet_url:
         cloud_menus, error_msg = load_menu_from_sheet(client, sheet_url)
         if cloud_menus:
             current_menus = cloud_menus
             st.toast("✅ 雲端菜單更新成功！")
         else:
-            # 讀取失敗時顯示提示 (在側邊欄)
             st.sidebar.warning(f"⚠️ 使用預設菜單 ({error_msg})")
-            st.sidebar.info("💡 **如何啟用雲端菜單？**\n\n請在您的 Google 試算表中新增一個分頁，名稱改為 `菜單設定`，並建立三欄：`店家`、`品項`、`價格`。")
+            st.sidebar.info("💡 **如何設定大小杯？**\n\n請在 Google 試算表「菜單設定」分頁，將欄位設為：`店家`、`品項`、`中杯`、`大杯`。")
 
 except Exception as e:
     st.sidebar.error(f"連線異常")
@@ -141,7 +162,6 @@ except Exception as e:
 
 st.sidebar.header("點餐設定")
 
-# 如果沒有菜單資料 (全空)
 if not current_menus:
     st.error("❌ 無法載入任何菜單，請檢查 Google Sheet 設定。")
     st.stop()
@@ -156,11 +176,21 @@ with st.form("order_form"):
         name = st.text_input("你的名字 (必填)")
     with col2:
         drink = st.selectbox("飲料品項", list(current_menu_items.keys()))
-    col3, col4 = st.columns(2)
+        # 取得該飲料的規格與價格表
+        price_dict = current_menu_items[drink]
+
+    # 改用三欄位佈局，加入大小選擇
+    col3, col4, col5 = st.columns(3)
     with col3:
-        sugar = st.selectbox("甜度", SUGAR_OPTS)
+        # 大小選單
+        size = st.selectbox("大小", list(price_dict.keys()))
+        price = price_dict[size]
+        st.caption(f"💰 價格：{price} 元")
     with col4:
+        sugar = st.selectbox("甜度", SUGAR_OPTS)
+    with col5:
         ice = st.selectbox("冰塊", ICE_OPTS)
+    
     note = st.text_input("備註")
     
     submitted = st.form_submit_button("送出訂單")
@@ -173,21 +203,17 @@ if submitted:
         st.error("❌ 請記得輸入名字！")
     else:
         try:
-            # 準備資料
-            price = current_menu_items[drink]
             order_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            row_data = [order_time, selected_store, name, drink, price, sugar, ice, note]
+            # 新增 size 欄位
+            row_data = [order_time, selected_store, name, drink, size, price, sugar, ice, note]
 
-            # 寫入資料
             sheet_url = s_info.get("spreadsheet")
             spreadsheet = client.open_by_url(sheet_url)
-            # 嘗試寫入第一個分頁 (通常是訂單紀錄頁)
-            # 建議把「菜單設定」放在第二頁，讓第一頁專門存訂單
             sheet = spreadsheet.get_worksheet(0) 
             
             sheet.append_row(row_data)
             
-            st.success(f"✅ {name} 點餐成功！")
+            st.success(f"✅ {name} 點餐成功！({drink} {size})")
             st.balloons()
             
         except Exception as e:
