@@ -16,37 +16,51 @@ def get_google_sheet_data():
         "https://www.googleapis.com/auth/drive"
     ]
     
-    # --- 智慧偵測 Secrets 格式 ---
-    # 情況 A: 使用標準 [connections.gsheets] 格式
-    if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
-        s_info = st.secrets["connections"]["gsheets"]
-    # 情況 B: 直接貼上 JSON 內容在根目錄
-    elif "type" in st.secrets and "project_id" in st.secrets:
-        s_info = st.secrets
-    else:
-        st.error("❌ 找不到 Google 憑證資料！請檢查 Secrets 設定是否包含 [connections.gsheets] 區塊。")
-        st.stop()
-    
-    # 建立憑證物件
-    creds = Credentials.from_service_account_info(
-        {
+    try:
+        # --- 1. 取得 Secrets 資料 ---
+        # 優先檢查標準位置 [connections.gsheets]
+        if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+            s_info = st.secrets["connections"]["gsheets"]
+        # 次要檢查根目錄 (直接貼 JSON)
+        elif "type" in st.secrets and "project_id" in st.secrets:
+            s_info = st.secrets
+        else:
+            raise ValueError("找不到憑證！請確認 Secrets 設定中包含 [connections.gsheets] 區塊。")
+
+        # --- 2. 處理 Private Key 格式問題 (關鍵) ---
+        # 這是最容易出錯的地方：Streamlit Secrets 有時會把 \n 讀成字串，導致憑證無效
+        # 我們強制把它轉回正確的換行符號
+        private_key = s_info["private_key"]
+        if "\\n" in private_key:
+            private_key = private_key.replace("\\n", "\n")
+
+        # --- 3. 建立憑證物件 ---
+        # 使用 .get() 提供預設值，避免漏貼一些固定網址導致報錯
+        creds_dict = {
             "type": s_info["type"],
             "project_id": s_info["project_id"],
             "private_key_id": s_info["private_key_id"],
-            "private_key": s_info["private_key"],
+            "private_key": private_key,  # 使用修正後的 Key
             "client_email": s_info["client_email"],
             "client_id": s_info["client_id"],
-            "auth_uri": s_info["auth_uri"],
-            "token_uri": s_info["token_uri"],
-            "auth_provider_x509_cert_url": s_info["auth_provider_x509_cert_url"],
+            "auth_uri": s_info.get("auth_uri", "https://accounts.google.com/o/oauth2/auth"),
+            "token_uri": s_info.get("token_uri", "https://oauth2.googleapis.com/token"),
+            "auth_provider_x509_cert_url": s_info.get("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs"),
             "client_x509_cert_url": s_info["client_x509_cert_url"]
-        },
-        scopes=scopes
-    )
-    
-    # 連線
-    client = gspread.authorize(creds)
-    return client, s_info
+        }
+        
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        
+        # --- 4. 連線 ---
+        client = gspread.authorize(creds)
+        return client, s_info
+
+    except KeyError as e:
+        st.error(f"❌ Secrets 設定缺少必要欄位：{e}")
+        st.stop()
+    except Exception as e:
+        st.error(f"❌ Google 連線發生錯誤：{e}")
+        st.stop()
 
 # ==========================================
 # 2. 菜單資料庫
@@ -80,7 +94,7 @@ try:
     # 在側邊欄顯示機器人資訊，方便除錯
     st.sidebar.info(f"🤖 **機器人帳號：**\n\n`{bot_email}`\n\n(請確認已將試算表共用給這個 Email)")
 except Exception as e:
-    st.error(f"連線設定有誤：{e}")
+    # 這裡的錯誤已經在 get_google_sheet_data 處理過了，這裡只是保險
     st.stop()
 
 st.sidebar.header("設定")
