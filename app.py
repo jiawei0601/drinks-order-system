@@ -4,33 +4,62 @@ from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 
+# PDF 相關套件
+import requests
+import os
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from io import BytesIO
+
 # ==========================================
-# 1. Google Sheets 連線設定 (使用 gspread)
+# 0. PDF 字型設定 (解決中文亂碼問題)
 # ==========================================
-# 加入快取裝飾器，避免每次操作都重新連線
+@st.cache_resource
+def setup_chinese_font():
+    font_path = "NotoSansTC-Regular.ttf"
+    # 使用 Google Fonts 的開源字型
+    font_url = "https://github.com/google/fonts/raw/main/ofl/notosanstc/NotoSansTC-Regular.ttf"
+    
+    if not os.path.exists(font_path):
+        with st.spinner("正在下載中文字型以支援 PDF..."):
+            try:
+                response = requests.get(font_url)
+                with open(font_path, "wb") as f:
+                    f.write(response.content)
+            except:
+                st.error("無法下載字型，PDF 中文可能會變亂碼。")
+                return None
+                
+    pdfmetrics.registerFont(TTFont('NotoSansTC', font_path))
+    return 'NotoSansTC'
+
+# ==========================================
+# 1. Google Sheets 連線設定
+# ==========================================
 @st.cache_resource
 def get_google_sheet_data():
-    # 定義授權範圍
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
     
     try:
-        # --- 1. 取得 Secrets 資料 ---
         if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
             s_info = st.secrets["connections"]["gsheets"]
         elif "type" in st.secrets and "project_id" in st.secrets:
             s_info = st.secrets
         else:
-            raise ValueError("找不到憑證！請確認 Secrets 設定中包含 [connections.gsheets] 區塊。")
+            raise ValueError("找不到憑證！請確認 Secrets 設定。")
 
-        # --- 2. 處理 Private Key 格式問題 ---
         private_key = s_info["private_key"]
         if "\\n" in private_key:
             private_key = private_key.replace("\\n", "\n")
 
-        # --- 3. 建立憑證物件 ---
         creds_dict = {
             "type": s_info["type"],
             "project_id": s_info["project_id"],
@@ -45,8 +74,6 @@ def get_google_sheet_data():
         }
         
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        
-        # --- 4. 連線 ---
         client = gspread.authorize(creds)
         return client, s_info
 
@@ -58,7 +85,7 @@ def get_google_sheet_data():
         st.stop()
 
 # ==========================================
-# 2. 讀取雲端菜單 (功能升級：支援大小杯)
+# 2. 菜單讀取 (支援大小杯)
 # ==========================================
 @st.cache_data(ttl=60)
 def load_menu_from_sheet(_client, sheet_url):
@@ -70,42 +97,28 @@ def load_menu_from_sheet(_client, sheet_url):
             return None, "找不到「菜單設定」分頁"
             
         records = worksheet.get_all_records()
-        
-        # 資料格式轉換: {店家: {品項: {規格: 價格}}}
         cloud_menus = {}
         for row in records:
             store = str(row.get("店家", "")).strip()
             item = str(row.get("品項", "")).strip()
-            
-            # 支援多種欄位名稱
             price_m = row.get("中杯") or row.get("M")
             price_l = row.get("大杯") or row.get("L")
-            price_single = row.get("價格") # 舊格式相容
+            price_single = row.get("價格")
             
             if store and item:
                 if store not in cloud_menus:
                     cloud_menus[store] = {}
-                
-                # 建構該品項的價格表
                 item_prices = {}
-                
-                # 嘗試解析中杯
                 try:
                     if price_m and int(price_m) > 0: item_prices["中杯"] = int(price_m)
                 except: pass
-                
-                # 嘗試解析大杯
                 try:
                     if price_l and int(price_l) > 0: item_prices["大杯"] = int(price_l)
                 except: pass
-                
-                # 如果沒有分大小，試試看舊的單一價格
                 if not item_prices:
                     try:
                         if price_single and int(price_single) > 0: item_prices["單一規格"] = int(price_single)
                     except: pass
-                
-                # 如果還是空的，預設為 0
                 if not item_prices:
                     item_prices = {"單一規格": 0}
 
@@ -113,28 +126,68 @@ def load_menu_from_sheet(_client, sheet_url):
                     
         if not cloud_menus:
             return None, "菜單分頁是空的"
-            
         return cloud_menus, None
-
     except Exception as e:
         return None, str(e)
 
-
 # ==========================================
-# 3. 預設備用菜單 (更新為含規格結構)
+# 3. PDF 生成函式
 # ==========================================
-DEFAULT_MENUS = {
-    "範例店家(未設定雲端菜單)": {
-        "測試紅茶": {"中杯": 30, "大杯": 35},
-        "測試綠茶": {"單一規格": 30}
-    }
-}
+def generate_pdf_report(df, total_amount):
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    elements = []
+    
+    # 註冊中文字型
+    font_name = setup_chinese_font()
+    if not font_name:
+        font_name = 'Helvetica' # 備用字型(不支援中文)
 
+    # 定義樣式
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('Title', parent=styles['Title'], fontName=font_name, fontSize=20, leading=24)
+    normal_style = ParagraphStyle('Normal', parent=styles['Normal'], fontName=font_name, fontSize=12, leading=16)
+    
+    # 標題
+    today = datetime.now().strftime("%Y-%m-%d")
+    elements.append(Paragraph(f"飲料訂購結算單 ({today})", title_style))
+    elements.append(Spacer(1, 12))
+    
+    # 總金額
+    elements.append(Paragraph(f"今日總營業額：{total_amount} 元", normal_style))
+    elements.append(Spacer(1, 12))
+    
+    # 轉換 DataFrame 為列表資料 (用於表格)
+    # 選取要顯示的欄位
+    display_cols = ['時間', '姓名', '品項', '大小', '甜度', '冰塊', '價格', '備註']
+    # 確保欄位存在
+    cols = [c for c in display_cols if c in df.columns]
+    
+    data = [cols] + df[cols].values.tolist()
+    
+    # 建立表格
+    t = Table(data)
+    t.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, -1), font_name),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('INNERGRID', (0, 0), (-1, -1), 0.25, colors.black),
+        ('BOX', (0, 0), (-1, -1), 0.25, colors.black),
+    ]))
+    
+    elements.append(t)
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+DEFAULT_MENUS = {"範例店家": {"紅茶": {"單一規格": 30}}}
 SUGAR_OPTS = ["正常糖", "少糖 (8分)", "半糖 (5分)", "微糖 (3分)", "一分糖", "無糖"]
 ICE_OPTS = ["正常冰", "少冰", "微冰", "去冰", "常溫", "熱"]
 
 # ==========================================
-# 4. 網頁介面
+# 4. 主程式介面
 # ==========================================
 st.title("🥤 辦公室飲料點餐系統")
 
@@ -146,44 +199,36 @@ current_menus = DEFAULT_MENUS
 try:
     client, s_info = get_google_sheet_data()
     sheet_url = s_info.get("spreadsheet")
-    
     if sheet_url:
         cloud_menus, error_msg = load_menu_from_sheet(client, sheet_url)
         if cloud_menus:
             current_menus = cloud_menus
-            st.toast("✅ 雲端菜單更新成功！")
         else:
             st.sidebar.warning(f"⚠️ 使用預設菜單 ({error_msg})")
-            st.sidebar.info("💡 **如何設定大小杯？**\n\n請在 Google 試算表「菜單設定」分頁，將欄位設為：`店家`、`品項`、`中杯`、`大杯`。")
-
 except Exception as e:
-    st.sidebar.error(f"連線異常")
-
+    st.sidebar.error(f"連線異常: {e}")
 
 st.sidebar.header("點餐設定")
 
 if not current_menus:
-    st.error("❌ 無法載入任何菜單，請檢查 Google Sheet 設定。")
+    st.error("❌ 無法載入菜單")
     st.stop()
 
 selected_store = st.sidebar.selectbox("今天喝哪一家？", list(current_menus.keys()))
 current_menu_items = current_menus[selected_store]
 st.subheader(f"目前店家：{selected_store}")
 
-# ⚠️ 注意：為了讓價格能即時連動，我們移除了 st.form 表單模式，改用一般輸入
+# 點餐區塊
 st.write("---")
 col1, col2 = st.columns(2)
 with col1:
     name = st.text_input("你的名字 (必填)")
 with col2:
     drink = st.selectbox("飲料品項", list(current_menu_items.keys()))
-    # 取得該飲料的規格與價格表
     price_dict = current_menu_items[drink]
 
-# 改用三欄位佈局，加入大小選擇
 col3, col4, col5 = st.columns(3)
 with col3:
-    # 大小選單 (選了之後，下方價格會立刻變動)
     size = st.selectbox("大小", list(price_dict.keys()))
     price = price_dict[size]
     st.info(f"💰 價格：**{price}** 元")
@@ -191,38 +236,87 @@ with col4:
     sugar = st.selectbox("甜度", SUGAR_OPTS)
 with col5:
     ice = st.selectbox("冰塊", ICE_OPTS)
-
 note = st.text_input("備註")
 
-# 按鈕改為一般按鈕，並加上 type="primary" 比較顯眼
-submitted = st.button("送出訂單", type="primary")
-
-# ==========================================
-# 5. 送出訂單邏輯
-# ==========================================
-if submitted:
+if st.button("送出訂單", type="primary"):
     if not name:
         st.error("❌ 請記得輸入名字！")
     else:
         try:
             order_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # 新增 size 欄位
             row_data = [order_time, selected_store, name, drink, size, price, sugar, ice, note]
-
             sheet_url = s_info.get("spreadsheet")
             spreadsheet = client.open_by_url(sheet_url)
             sheet = spreadsheet.get_worksheet(0) 
-            
             sheet.append_row(row_data)
-            
-            st.success(f"✅ {name} 點餐成功！({drink} {size})")
+            st.success(f"✅ {name} 點餐成功！")
             st.balloons()
-            
         except Exception as e:
             st.error(f"⚠️ 寫入失敗：{e}")
 
 # ==========================================
-# 6. 顯示訂單列表
+# 5. 管理員結算專區 (PDF與清空功能)
+# ==========================================
+st.sidebar.divider()
+st.sidebar.header("👮‍♂️ 管理員專區")
+
+if st.sidebar.checkbox("開啟結算功能"):
+    st.divider()
+    st.header("💰 結算管理")
+    
+    try:
+        if s_info:
+            sheet_url = s_info.get("spreadsheet")
+            spreadsheet = client.open_by_url(sheet_url)
+            sheet = spreadsheet.get_worksheet(0)
+            data = sheet.get_all_records()
+            
+            if data:
+                df = pd.DataFrame(data)
+                
+                # 計算金額
+                total_amount = 0
+                if '價格' in df.columns: # 相容性檢查
+                    total_amount = pd.to_numeric(df['價格'], errors='coerce').fillna(0).sum()
+                elif 'Price' in df.columns:
+                    total_amount = pd.to_numeric(df['Price'], errors='coerce').fillna(0).sum()
+                
+                st.metric("💵 今日總營業額", f"{int(total_amount)} 元")
+                st.dataframe(df)
+                
+                # --- PDF 下載按鈕 ---
+                pdf_bytes = generate_pdf_report(df, int(total_amount))
+                st.download_button(
+                    label="📄 下載 PDF 結算單",
+                    data=pdf_bytes,
+                    file_name=f"飲料結算_{datetime.now().strftime('%Y%m%d')}.pdf",
+                    mime='application/pdf',
+                )
+                
+                st.write("---")
+                st.warning("⚠️ **危險操作區**")
+                
+                # --- 清空儲存格按鈕 ---
+                # 使用二次確認機制避免誤按
+                if st.button("🗑️ 清空所有訂單 (歸零)"):
+                    try:
+                        # 讀取第一列 (保留標題)
+                        headers = sheet.row_values(1)
+                        # 清空整個工作表
+                        sheet.clear()
+                        # 把標題寫回去
+                        sheet.append_row(headers)
+                        st.success("✅ 資料已清空，可以開始新的一天了！")
+                        st.rerun() # 重新整理頁面
+                    except Exception as e:
+                        st.error(f"清空失敗：{e}")
+            else:
+                st.info("📭 目前是空的，沒有訂單。")
+    except Exception as e:
+        st.error(f"讀取資料失敗：{e}")
+
+# ==========================================
+# 6. 訂單列表
 # ==========================================
 st.divider()
 st.write("📊 **目前訂單列表：**")
