@@ -99,7 +99,7 @@ def get_google_sheet_data():
         st.stop()
 
 # ==========================================
-# 2. 資料讀取 (菜單 & 訂單) - 含快取機制
+# 2. 資料讀取 (菜單、加料 & 訂單) - 含快取機制
 # ==========================================
 
 # 讀取菜單 (快取 60 秒)
@@ -146,7 +146,36 @@ def load_menu_from_sheet(_client, sheet_url):
     except Exception as e:
         return None, str(e)
 
-# 讀取訂單 (快取 5 秒，避免輸入時瘋狂刷 API 導致 429 錯誤)
+# 讀取加料設定 (快取 60 秒)
+@st.cache_data(ttl=60)
+def load_toppings_from_sheet(_client, sheet_url):
+    try:
+        spreadsheet = _client.open_by_url(sheet_url)
+        try:
+            worksheet = spreadsheet.worksheet("加料設定")
+        except gspread.WorksheetNotFound:
+            return {} # 如果沒有設定加料分頁，回傳空字典，不報錯
+            
+        records = worksheet.get_all_records()
+        toppings = {}
+        # 格式: {店家: {加料名: 價格, 加料名2: 價格}}
+        for row in records:
+            store = str(row.get("店家", "")).strip()
+            name = str(row.get("加料品項", "")).strip()
+            price = row.get("價格")
+            
+            if store and name:
+                if store not in toppings:
+                    toppings[store] = {}
+                try:
+                    toppings[store][name] = int(price)
+                except:
+                    toppings[store][name] = 0
+        return toppings
+    except Exception:
+        return {}
+
+# 讀取訂單 (快取 5 秒)
 @st.cache_data(ttl=5)
 def get_orders_from_sheet(_client, sheet_url):
     try:
@@ -178,7 +207,8 @@ def generate_pdf_report(df, total_amount):
     elements.append(Paragraph(f"今日總營業額：{total_amount} 元", normal_style))
     elements.append(Spacer(1, 12))
     
-    display_cols = ['時間', '姓名', '品項', '大小', '甜度', '冰塊', '價格', '備註']
+    # 這裡加入 '加料' 欄位到 PDF
+    display_cols = ['時間', '姓名', '品項', '大小', '加料', '甜度', '冰塊', '價格', '備註']
     cols = [c for c in display_cols if c in df.columns]
     
     data = [cols] + df[cols].values.tolist()
@@ -192,6 +222,7 @@ def generate_pdf_report(df, total_amount):
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('INNERGRID', (0, 0), (-1, -1), 0.25, colors.black),
         ('BOX', (0, 0), (-1, -1), 0.25, colors.black),
+        ('FONTSIZE', (0, 0), (-1, -1), 10), # 稍微縮小字體以容納更多欄位
     ]))
     
     elements.append(t)
@@ -211,6 +242,7 @@ st.title("🥤 辦公室飲料點餐系統")
 client = None
 s_info = None
 current_menus = DEFAULT_MENUS
+all_toppings = {}
 
 # --- 連線與資料載入 ---
 try:
@@ -218,6 +250,8 @@ try:
     sheet_url = s_info.get("spreadsheet")
     if sheet_url:
         cloud_menus, error_msg = load_menu_from_sheet(client, sheet_url)
+        all_toppings = load_toppings_from_sheet(client, sheet_url)
+        
         if cloud_menus:
             current_menus = cloud_menus
         else:
@@ -247,12 +281,40 @@ with col2:
 col3, col4, col5 = st.columns(3)
 with col3:
     size = st.selectbox("大小", list(price_dict.keys()))
-    price = price_dict[size]
-    st.info(f"💰 價格：**{price}** 元")
+    base_price = price_dict[size]
 with col4:
     sugar = st.selectbox("甜度", SUGAR_OPTS)
 with col5:
     ice = st.selectbox("冰塊", ICE_OPTS)
+
+# --- 加料區塊 (新增) ---
+topping_price = 0
+selected_toppings = []
+store_toppings_options = all_toppings.get(selected_store, {})
+
+if store_toppings_options:
+    st.write("---")
+    st.markdown("#### 🍬 加料區")
+    # 使用 multiselect 讓使用者可以選多種料
+    # 顯示格式： 珍珠 (+10)
+    topping_labels = [f"{name} (+{price})" for name, price in store_toppings_options.items()]
+    selected_labels = st.multiselect("選擇配料", topping_labels)
+    
+    # 計算加料價格
+    for label in selected_labels:
+        # 從 "珍珠 (+10)" 解析出 "珍珠" 和 10
+        t_name = label.split(" (+")[0]
+        t_price = store_toppings_options[t_name]
+        topping_price += t_price
+        selected_toppings.append(t_name)
+else:
+    st.caption("(此店家目前無設定加料選項)")
+
+# 計算總價與顯示
+final_price = base_price + topping_price
+st.write("---")
+st.info(f"💰 **總金額：{final_price} 元** (飲料 {base_price} + 加料 {topping_price})")
+
 note = st.text_input("備註")
 
 if st.button("送出訂單", type="primary"):
@@ -261,13 +323,19 @@ if st.button("送出訂單", type="primary"):
     else:
         try:
             order_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            row_data = [order_time, selected_store, name, drink, size, price, sugar, ice, note]
+            topping_str = ", ".join(selected_toppings) if selected_toppings else ""
+            
+            # 更新寫入欄位順序，加入加料
+            row_data = [
+                order_time, selected_store, name, drink, size, 
+                topping_str, final_price, sugar, ice, note
+            ]
+            
             sheet_url = s_info.get("spreadsheet")
             spreadsheet = client.open_by_url(sheet_url)
             sheet = spreadsheet.get_worksheet(0) 
             sheet.append_row(row_data)
             
-            # 重要：清除訂單快取，讓新訂單馬上顯示
             get_orders_from_sheet.clear()
             
             st.success(f"✅ {name} 點餐成功！")
@@ -288,8 +356,6 @@ if st.sidebar.checkbox("開啟結算功能"):
     try:
         if s_info:
             sheet_url = s_info.get("spreadsheet")
-            
-            # 改用快取函式讀取資料
             all_values = get_orders_from_sheet(client, sheet_url)
             
             if len(all_values) > 1:
@@ -331,13 +397,13 @@ if st.sidebar.checkbox("開啟結算功能"):
                     
                     if st.button("🗑️ 清空所有訂單 (歸零)"):
                         try:
-                            standard_headers = ['時間', '店家', '姓名', '品項', '大小', '價格', '甜度', '冰塊', '備註']
+                            # 更新標準標題，加入 加料
+                            standard_headers = ['時間', '店家', '姓名', '品項', '大小', '加料', '價格', '甜度', '冰塊', '備註']
                             spreadsheet = client.open_by_url(sheet_url)
                             sheet = spreadsheet.get_worksheet(0)
                             sheet.clear()
                             sheet.append_row(standard_headers)
                             
-                            # 重要：清除快取
                             get_orders_from_sheet.clear()
                             
                             st.success("✅ 資料已清空，可以開始新的一天了！")
@@ -357,7 +423,6 @@ st.write("📊 **目前訂單列表：**")
 try:
     if s_info:
         sheet_url = s_info.get("spreadsheet")
-        # 改用快取函式讀取資料
         all_values = get_orders_from_sheet(client, sheet_url)
         
         if len(all_values) > 1:
