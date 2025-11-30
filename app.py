@@ -269,10 +269,17 @@ if st.sidebar.checkbox("開啟結算功能"):
             sheet_url = s_info.get("spreadsheet")
             spreadsheet = client.open_by_url(sheet_url)
             sheet = spreadsheet.get_worksheet(0)
-            data = sheet.get_all_records()
             
-            if data:
-                df = pd.DataFrame(data)
+            # ⚠️ 修改：改用 get_all_values() 來避免 "duplicate header" 錯誤
+            all_values = sheet.get_all_values()
+            
+            if len(all_values) > 1: # 確保至少有標題列 + 一筆資料
+                # 第一列是標題，剩下的都是資料
+                headers = all_values[0]
+                rows = all_values[1:]
+                
+                # 建立 DataFrame，如果有重複的空白標題也沒關係
+                df = pd.DataFrame(rows, columns=headers)
                 
                 # 計算金額
                 total_amount = 0
@@ -297,17 +304,16 @@ if st.sidebar.checkbox("開啟結算功能"):
                 st.warning("⚠️ **危險操作區**")
                 
                 # --- 清空儲存格按鈕 ---
-                # 使用二次確認機制避免誤按
                 if st.button("🗑️ 清空所有訂單 (歸零)"):
                     try:
-                        # 讀取第一列 (保留標題)
-                        headers = sheet.row_values(1)
+                        # 定義標準標題，避免讀取到髒標題
+                        standard_headers = ['時間', '店家', '姓名', '品項', '大小', '價格', '甜度', '冰塊', '備註']
                         # 清空整個工作表
                         sheet.clear()
-                        # 把標題寫回去
-                        sheet.append_row(headers)
+                        # 把標準標題寫回去
+                        sheet.append_row(standard_headers)
                         st.success("✅ 資料已清空，可以開始新的一天了！")
-                        st.rerun() # 重新整理頁面
+                        st.rerun()
                     except Exception as e:
                         st.error(f"清空失敗：{e}")
             else:
@@ -325,9 +331,15 @@ try:
         sheet_url = s_info.get("spreadsheet")
         spreadsheet = client.open_by_url(sheet_url)
         sheet = spreadsheet.get_worksheet(0)
-        data = sheet.get_all_records()
-        if data:
-            st.dataframe(pd.DataFrame(data))
+        
+        # ⚠️ 修改：同樣改用 get_all_values() 避免錯誤
+        all_values = sheet.get_all_values()
+        
+        if len(all_values) > 1:
+            headers = all_values[0]
+            rows = all_values[1:]
+            df = pd.DataFrame(rows, columns=headers)
+            st.dataframe(df)
         else:
             st.info("目前沒有資料")
 except:
