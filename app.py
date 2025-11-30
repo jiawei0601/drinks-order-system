@@ -270,52 +270,63 @@ if st.sidebar.checkbox("開啟結算功能"):
             spreadsheet = client.open_by_url(sheet_url)
             sheet = spreadsheet.get_worksheet(0)
             
-            # ⚠️ 修改：改用 get_all_values() 來避免 "duplicate header" 錯誤
+            # 使用 get_all_values() 讀取所有資料
             all_values = sheet.get_all_values()
             
-            if len(all_values) > 1: # 確保至少有標題列 + 一筆資料
-                # 第一列是標題，剩下的都是資料
+            if len(all_values) > 1:
                 headers = all_values[0]
                 rows = all_values[1:]
                 
-                # 建立 DataFrame，如果有重複的空白標題也沒關係
-                df = pd.DataFrame(rows, columns=headers)
+                # --- 修正：過濾掉空的標題欄位 ---
+                # 找出標題不為空的索引
+                valid_indices = [i for i, h in enumerate(headers) if h.strip()]
                 
-                # 計算金額
-                total_amount = 0
-                if '價格' in df.columns: # 相容性檢查
-                    total_amount = pd.to_numeric(df['價格'], errors='coerce').fillna(0).sum()
-                elif 'Price' in df.columns:
-                    total_amount = pd.to_numeric(df['Price'], errors='coerce').fillna(0).sum()
-                
-                st.metric("💵 今日總營業額", f"{int(total_amount)} 元")
-                st.dataframe(df)
-                
-                # --- PDF 下載按鈕 ---
-                pdf_bytes = generate_pdf_report(df, int(total_amount))
-                st.download_button(
-                    label="📄 下載 PDF 結算單",
-                    data=pdf_bytes,
-                    file_name=f"飲料結算_{datetime.now().strftime('%Y%m%d')}.pdf",
-                    mime='application/pdf',
-                )
-                
-                st.write("---")
-                st.warning("⚠️ **危險操作區**")
-                
-                # --- 清空儲存格按鈕 ---
-                if st.button("🗑️ 清空所有訂單 (歸零)"):
-                    try:
-                        # 定義標準標題，避免讀取到髒標題
-                        standard_headers = ['時間', '店家', '姓名', '品項', '大小', '價格', '甜度', '冰塊', '備註']
-                        # 清空整個工作表
-                        sheet.clear()
-                        # 把標準標題寫回去
-                        sheet.append_row(standard_headers)
-                        st.success("✅ 資料已清空，可以開始新的一天了！")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"清空失敗：{e}")
+                if not valid_indices:
+                    st.warning("⚠️ 讀取失敗：找不到任何有效的欄位標題。")
+                else:
+                    # 只保留有效欄位的標題和資料
+                    clean_headers = [headers[i] for i in valid_indices]
+                    clean_rows = []
+                    for row in rows:
+                        # 確保 row 的長度足夠，不足補空字串
+                        clean_row = [row[i] if i < len(row) else "" for i in valid_indices]
+                        clean_rows.append(clean_row)
+                    
+                    # 建立 DataFrame
+                    df = pd.DataFrame(clean_rows, columns=clean_headers)
+                    
+                    # 計算金額
+                    total_amount = 0
+                    if '價格' in df.columns:
+                        total_amount = pd.to_numeric(df['價格'], errors='coerce').fillna(0).sum()
+                    elif 'Price' in df.columns:
+                        total_amount = pd.to_numeric(df['Price'], errors='coerce').fillna(0).sum()
+                    
+                    st.metric("💵 今日總營業額", f"{int(total_amount)} 元")
+                    st.dataframe(df)
+                    
+                    # --- PDF 下載按鈕 ---
+                    pdf_bytes = generate_pdf_report(df, int(total_amount))
+                    st.download_button(
+                        label="📄 下載 PDF 結算單",
+                        data=pdf_bytes,
+                        file_name=f"飲料結算_{datetime.now().strftime('%Y%m%d')}.pdf",
+                        mime='application/pdf',
+                    )
+                    
+                    st.write("---")
+                    st.warning("⚠️ **危險操作區**")
+                    
+                    # --- 清空儲存格按鈕 ---
+                    if st.button("🗑️ 清空所有訂單 (歸零)"):
+                        try:
+                            standard_headers = ['時間', '店家', '姓名', '品項', '大小', '價格', '甜度', '冰塊', '備註']
+                            sheet.clear()
+                            sheet.append_row(standard_headers)
+                            st.success("✅ 資料已清空，可以開始新的一天了！")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"清空失敗：{e}")
             else:
                 st.info("📭 目前是空的，沒有訂單。")
     except Exception as e:
@@ -332,14 +343,23 @@ try:
         spreadsheet = client.open_by_url(sheet_url)
         sheet = spreadsheet.get_worksheet(0)
         
-        # ⚠️ 修改：同樣改用 get_all_values() 避免錯誤
         all_values = sheet.get_all_values()
         
         if len(all_values) > 1:
             headers = all_values[0]
             rows = all_values[1:]
-            df = pd.DataFrame(rows, columns=headers)
-            st.dataframe(df)
+            
+            # --- 修正：同樣過濾掉空的標題欄位 ---
+            valid_indices = [i for i, h in enumerate(headers) if h.strip()]
+            if valid_indices:
+                clean_headers = [headers[i] for i in valid_indices]
+                clean_rows = []
+                for row in rows:
+                    clean_row = [row[i] if i < len(row) else "" for i in valid_indices]
+                    clean_rows.append(clean_row)
+                
+                df = pd.DataFrame(clean_rows, columns=clean_headers)
+                st.dataframe(df)
         else:
             st.info("目前沒有資料")
 except:
