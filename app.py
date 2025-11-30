@@ -7,6 +7,8 @@ from google.oauth2.service_account import Credentials
 # ==========================================
 # 1. Google Sheets 連線設定 (使用 gspread)
 # ==========================================
+# 加入快取裝飾器，避免每次操作都重新連線
+@st.cache_resource
 def get_google_sheet_data():
     # 定義授權範圍
     scopes = [
@@ -14,9 +16,16 @@ def get_google_sheet_data():
         "https://www.googleapis.com/auth/drive"
     ]
     
-    # 從 Streamlit Secrets 讀取憑證
-    # 注意：這裡會自動去抓您之前貼在 Secrets [connections.gsheets] 裡的資料
-    s_info = st.secrets["connections"]["gsheets"]
+    # --- 智慧偵測 Secrets 格式 ---
+    # 情況 A: 使用標準 [connections.gsheets] 格式
+    if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+        s_info = st.secrets["connections"]["gsheets"]
+    # 情況 B: 直接貼上 JSON 內容在根目錄
+    elif "type" in st.secrets and "project_id" in st.secrets:
+        s_info = st.secrets
+    else:
+        st.error("❌ 找不到 Google 憑證資料！請檢查 Secrets 設定是否包含 [connections.gsheets] 區塊。")
+        st.stop()
     
     # 建立憑證物件
     creds = Credentials.from_service_account_info(
@@ -39,7 +48,12 @@ def get_google_sheet_data():
     client = gspread.authorize(creds)
     
     # 開啟試算表 (透過網址)
-    sheet_url = s_info["spreadsheet"]
+    # 嘗試從 Secrets 讀取網址，如果沒有則使用預設提示
+    sheet_url = s_info.get("spreadsheet")
+    if not sheet_url:
+        st.error("❌ Secrets 中缺少 'spreadsheet' 網址設定。請在 Secrets 中加入 spreadsheet = '...您的網址...'")
+        st.stop()
+        
     sheet = client.open_by_url(sheet_url).sheet1
     return sheet
 
