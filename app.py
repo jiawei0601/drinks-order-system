@@ -28,19 +28,16 @@ def get_google_sheet_data():
             raise ValueError("找不到憑證！請確認 Secrets 設定中包含 [connections.gsheets] 區塊。")
 
         # --- 2. 處理 Private Key 格式問題 (關鍵) ---
-        # 這是最容易出錯的地方：Streamlit Secrets 有時會把 \n 讀成字串，導致憑證無效
-        # 我們強制把它轉回正確的換行符號
         private_key = s_info["private_key"]
         if "\\n" in private_key:
             private_key = private_key.replace("\\n", "\n")
 
         # --- 3. 建立憑證物件 ---
-        # 使用 .get() 提供預設值，避免漏貼一些固定網址導致報錯
         creds_dict = {
             "type": s_info["type"],
             "project_id": s_info["project_id"],
             "private_key_id": s_info["private_key_id"],
-            "private_key": private_key,  # 使用修正後的 Key
+            "private_key": private_key,
             "client_email": s_info["client_email"],
             "client_id": s_info["client_id"],
             "auth_uri": s_info.get("auth_uri", "https://accounts.google.com/o/oauth2/auth"),
@@ -87,17 +84,41 @@ ICE_OPTS = ["正常冰", "少冰", "微冰", "去冰", "常溫", "熱"]
 # ==========================================
 st.title("🥤 辦公室飲料點餐系統")
 
-# 嘗試連線取得機器人資訊 (為了顯示 Email 給使用者看)
+# --- 側邊欄：連線狀態檢查 (新增功能) ---
+st.sidebar.header("連線狀態")
 try:
     client, s_info = get_google_sheet_data()
     bot_email = s_info['client_email']
-    # 在側邊欄顯示機器人資訊，方便除錯
-    st.sidebar.info(f"🤖 **機器人帳號：**\n\n`{bot_email}`\n\n(請確認已將試算表共用給這個 Email)")
+    sheet_url = s_info.get("spreadsheet")
+
+    # 檢查 1: 機器人 Email
+    st.sidebar.info(f"🤖 **機器人帳號：**\n\n`{bot_email}`")
+
+    # 檢查 2: 試算表網址檢查 (防呆)
+    if not sheet_url:
+        st.sidebar.error("❌ 未設定 spreadsheet 網址")
+        st.error("請在 Secrets 中加入 `spreadsheet = '您的網址'`")
+        st.stop()
+    elif "您的試算表ID" in sheet_url:
+        st.sidebar.error("❌ 網址為範例預設值")
+        st.error("🚨 **設定錯誤！**\n\n您在 Secrets 裡的 `spreadsheet` 還是範例文字。\n請去 Streamlit Cloud Settings -> Secrets，把網址改成您真正的 Google 試算表網址。")
+        st.stop()
+    else:
+        # 檢查 3: 嘗試實際連線
+        try:
+            spreadsheet = client.open_by_url(sheet_url)
+            sheet = spreadsheet.get_worksheet(0)
+            st.sidebar.success(f"✅ 已連線到試算表：\n{spreadsheet.title}")
+        except Exception as conn_err:
+            st.sidebar.error("❌ 無法開啟試算表")
+            st.sidebar.warning("請確認已將試算表「共用」給機器人，並設為「編輯者」。")
+            
 except Exception as e:
-    # 這裡的錯誤已經在 get_google_sheet_data 處理過了，這裡只是保險
+    st.sidebar.error(f"連線設定有誤")
     st.stop()
 
-st.sidebar.header("設定")
+st.sidebar.divider()
+st.sidebar.header("點餐設定")
 selected_store = st.sidebar.selectbox("今天喝哪一家？", list(ALL_MENUS.keys()))
 current_menu = ALL_MENUS[selected_store]
 st.subheader(f"目前店家：{selected_store}")
@@ -130,13 +151,7 @@ if submitted:
             order_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             row_data = [order_time, selected_store, name, drink, price, sugar, ice, note]
 
-            # 取得試算表網址
-            sheet_url = s_info.get("spreadsheet")
-            if not sheet_url:
-                st.error("❌ Secrets 中缺少 'spreadsheet' 設定。")
-                st.stop()
-
-            # 開啟試算表
+            # 直接使用上方檢查過的變數
             spreadsheet = client.open_by_url(sheet_url)
             sheet = spreadsheet.get_worksheet(0) # 寫入第一頁
             
@@ -152,11 +167,9 @@ if submitted:
             
             # 智慧錯誤分析
             if "403" in error_msg or "permission" in error_msg.lower():
-                st.warning(f"🚨 **權限錯誤！**\n請複製側邊欄那個 `iam.gserviceaccount.com` 的 Email，\n去您的 Google 試算表按「共用」，把它加為「編輯者」。")
+                st.warning(f"🚨 **權限錯誤！**\n請複製側邊欄的機器人 Email，去 Google 試算表按「共用」，把它加為「編輯者」。")
             elif "404" in error_msg or "not found" in error_msg.lower():
-                st.warning("🚨 **找不到試算表！**\n請確認 Secrets 裡的網址是否正確，且您已將試算表共用給機器人。")
-            elif "API has not been used" in error_msg:
-                st.warning("🚨 **API 未啟用！**\n請去 Google Cloud Console 啟用 Google Sheets API。")
+                st.warning("🚨 **找不到試算表！**\n請確認 Secrets 裡的網址是否正確。")
 
 # ==========================================
 # 5. 顯示目前清單
@@ -164,8 +177,7 @@ if submitted:
 st.divider()
 st.write("📊 **目前訂單列表：**")
 try:
-    sheet_url = s_info.get("spreadsheet")
-    if sheet_url:
+    if sheet_url and "您的試算表ID" not in sheet_url:
         spreadsheet = client.open_by_url(sheet_url)
         sheet = spreadsheet.get_worksheet(0)
         data = sheet.get_all_records()
