@@ -1,140 +1,128 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from streamlit_gsheets import GSheetsConnection
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ==========================================
-# 1. 基礎設定與菜單資料
+# 1. Google Sheets 連線設定 (使用 gspread)
 # ==========================================
+def get_google_sheet_data():
+    # 定義授權範圍
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    
+    # 從 Streamlit Secrets 讀取憑證
+    # 注意：這裡會自動去抓您之前貼在 Secrets [connections.gsheets] 裡的資料
+    s_info = st.secrets["connections"]["gsheets"]
+    
+    # 建立憑證物件
+    creds = Credentials.from_service_account_info(
+        {
+            "type": s_info["type"],
+            "project_id": s_info["project_id"],
+            "private_key_id": s_info["private_key_id"],
+            "private_key": s_info["private_key"],
+            "client_email": s_info["client_email"],
+            "client_id": s_info["client_id"],
+            "auth_uri": s_info["auth_uri"],
+            "token_uri": s_info["token_uri"],
+            "auth_provider_x509_cert_url": s_info["auth_provider_x509_cert_url"],
+            "client_x509_cert_url": s_info["client_x509_cert_url"]
+        },
+        scopes=scopes
+    )
+    
+    # 連線
+    client = gspread.authorize(creds)
+    
+    # 開啟試算表 (透過網址)
+    sheet_url = s_info["spreadsheet"]
+    sheet = client.open_by_url(sheet_url).sheet1
+    return sheet
 
-# 設定網頁標題與圖示
-st.set_page_config(page_title="辦公室點餐系統", page_icon="🥤")
-
-# 建立 Google Sheets 連線
-# ⚠️ 注意：必須先在 Streamlit Cloud 的 Secrets 設定好 [connections.gsheets]
-conn = st.connection("gsheets", type=GSheetsConnection)
-
-# 定義菜單 (您可以隨時在這裡新增店家或修改價格)
+# ==========================================
+# 2. 菜單資料庫
+# ==========================================
 ALL_MENUS = {
     "可不可熟成紅茶": {
-        "熟成紅茶": 30,
-        "鴉片紅茶": 30,
-        "太妃紅茶": 35,
-        "熟成冷露": 30,
-        "白玉歐蕾": 50,
-        "春梅冰茶": 45
+        "熟成紅茶": 30, "鴉片紅茶": 30, "太妃紅茶": 35,
+        "熟成冷露": 30, "白玉歐蕾": 50, "春梅冰茶": 45
     },
     "50嵐": {
-        "四季春青茶": 30,
-        "黃金烏龍": 30,
-        "珍珠奶茶": 50,
-        "波霸奶茶": 50,
-        "紅茶拿鐵": 55,
-        "8冰綠": 50
+        "四季春青茶": 30, "黃金烏龍": 30, "珍珠奶茶": 50,
+        "波霸奶茶": 50, "紅茶拿鐵": 55, "8冰綠": 50
     },
     "迷客夏": {
-        "大正紅茶拿鐵": 60,
-        "伯爵紅茶拿鐵": 60,
-        "珍珠紅茶拿鐵": 65,
-        "柳丁綠茶": 60,
-        "芋頭鮮奶": 65
+        "大正紅茶拿鐵": 60, "伯爵紅茶拿鐵": 60, "珍珠紅茶拿鐵": 65,
+        "柳丁綠茶": 60, "芋頭鮮奶": 65
     }
 }
-
-# 定義通用選項
 SUGAR_OPTS = ["正常糖", "少糖 (8分)", "半糖 (5分)", "微糖 (3分)", "一分糖", "無糖"]
 ICE_OPTS = ["正常冰", "少冰", "微冰", "去冰", "常溫", "熱"]
 
 # ==========================================
-# 2. 網頁介面設計
+# 3. 網頁介面
 # ==========================================
-
 st.title("🥤 辦公室飲料點餐系統")
 
-# --- 側邊欄：選擇店家 ---
 st.sidebar.header("設定")
 selected_store = st.sidebar.selectbox("今天喝哪一家？", list(ALL_MENUS.keys()))
-
-# 根據選擇載入對應菜單
 current_menu = ALL_MENUS[selected_store]
 st.subheader(f"目前店家：{selected_store}")
 
-# --- 主表單區域 ---
 with st.form("order_form"):
     col1, col2 = st.columns(2)
     with col1:
         name = st.text_input("你的名字 (必填)")
     with col2:
-        # 下拉選單會自動根據上面的 current_menu 變換
         drink = st.selectbox("飲料品項", list(current_menu.keys()))
-    
     col3, col4 = st.columns(2)
     with col3:
         sugar = st.selectbox("甜度", SUGAR_OPTS)
     with col4:
         ice = st.selectbox("冰塊", ICE_OPTS)
-        
-    note = st.text_input("備註 (例如: 加珍珠+10元)")
-
-    # 送出按鈕
+    note = st.text_input("備註")
+    
     submitted = st.form_submit_button("送出訂單")
 
 # ==========================================
-# 3. 邏輯處理：送出訂單與儲存
+# 4. 邏輯處理
 # ==========================================
-
 if submitted:
     if not name:
         st.error("❌ 請記得輸入名字！")
     else:
         try:
-            # 3-1. 準備要寫入的新資料
+            # 準備資料
             price = current_menu[drink]
             order_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            row_data = [order_time, selected_store, name, drink, price, sugar, ice, note]
+
+            # 連線並寫入 (使用 gspread 直接 append_row，速度更快更穩)
+            sheet = get_google_sheet_data()
+            sheet.append_row(row_data)
             
-            new_entry = pd.DataFrame([{
-                "時間": order_time,
-                "店家": selected_store,
-                "姓名": name,
-                "品項": drink,
-                "價格": price,
-                "甜度": sugar,
-                "冰塊": ice,
-                "備註": note
-            }])
-
-            # 3-2. 讀取目前的 Google Sheet 資料 (ttl=0 代表不快取，強制抓最新的)
-            # 預設寫入 Sheet1，如果你的分頁名稱不同請修改 worksheet="你的分頁名稱"
-            try:
-                existing_data = conn.read(worksheet="Sheet1", usecols=list(range(8)), ttl=0)
-                # 簡單檢查是否為空表格
-                if existing_data.empty:
-                    updated_data = new_entry
-                else:
-                    updated_data = pd.concat([existing_data, new_entry], ignore_index=True)
-            except:
-                # 如果讀取失敗(例如表格是全空的)，直接當作這是第一筆資料
-                updated_data = new_entry
-
-            # 3-3. 將合併後的資料寫回 Google Sheet
-            conn.update(worksheet="Sheet1", data=updated_data)
-
-            # 3-4. 成功訊息
-            st.success(f"✅ {name} 點餐成功！資料已寫入試算表。")
+            st.success(f"✅ {name} 點餐成功！")
             st.balloons()
             
         except Exception as e:
-            st.error(f"⚠️ 寫入失敗，請檢查 Secrets 設定。錯誤訊息：{e}")
+            st.error(f"⚠️ 寫入失敗：{e}")
 
 # ==========================================
-# 4. 顯示目前統計 (選用功能)
+# 5. 顯示目前清單
 # ==========================================
 st.divider()
 st.write("📊 **目前訂單列表：**")
-
 try:
-    # 再次讀取顯示給使用者看
-    display_df = conn.read(worksheet="Sheet1", ttl=0)
-    st.dataframe(display_df)
-except:
-    st.info("目前還沒有訂單，或是無法讀取試算表。")
+    sheet = get_google_sheet_data()
+    # 讀取所有紀錄並轉成 DataFrame 顯示
+    data = sheet.get_all_records()
+    if data:
+        st.dataframe(pd.DataFrame(data))
+    else:
+        st.info("目前沒有資料")
+except Exception as e:
+    st.info("尚無訂單或連線設定中...")
