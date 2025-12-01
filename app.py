@@ -242,6 +242,7 @@ def generate_pdf_report(df, total_amount):
     elements.append(Paragraph(f"今日總營業額：{total_amount} 元", normal_style))
     elements.append(Spacer(1, 12))
     
+    # 定義要匯出到 PDF 的欄位
     display_cols = ['時間', '姓名', '品項', '大小', '加料', '甜度', '冰塊', '價格', '備註']
     cols = [c for c in display_cols if c in df.columns]
     
@@ -385,13 +386,13 @@ if st.sidebar.checkbox("開啟結算功能"):
     try:
         if s_info:
             sheet_url = s_info.get("spreadsheet")
-            # 改用快取函式讀取資料
             all_values = get_orders_from_sheet(client, sheet_url)
             
             if len(all_values) > 1:
                 headers = all_values[0]
                 rows = all_values[1:]
                 
+                # 過濾空白標題
                 valid_indices = [i for i, h in enumerate(headers) if h.strip()]
                 
                 if not valid_indices:
@@ -413,15 +414,63 @@ if st.sidebar.checkbox("開啟結算功能"):
                     
                     st.metric("💵 今日總營業額", f"{int(total_amount)} 元")
                     
-                    # --- 編輯區塊 ---
+                    # --- 編輯區塊 (升級版：加入下拉選單) ---
                     st.markdown("### ✏️ 訂單管理與編輯")
                     st.caption("您可以直接點擊表格修改內容，或選取左側方框刪除列。修改完請務必按下方「儲存變更」。")
                     
+                    # 準備下拉選單的選項來源
+                    all_stores = list(current_menus.keys())
+                    all_items = set()
+                    for m in current_menus.values():
+                        all_items.update(m.keys())
+                    all_items = sorted(list(all_items))
+                    all_sizes = ["中杯", "大杯", "單一規格", "L", "M"]
+
                     edited_df = st.data_editor(
                         df, 
                         num_rows="dynamic",
                         use_container_width=True,
-                        key="order_editor"
+                        key="order_editor",
+                        column_config={
+                            "店家": st.column_config.SelectboxColumn(
+                                "店家",
+                                help="選擇店家",
+                                width="medium",
+                                options=all_stores,
+                                required=True,
+                            ),
+                            "品項": st.column_config.SelectboxColumn(
+                                "品項",
+                                help="選擇飲料",
+                                width="medium",
+                                options=all_items,
+                                required=True,
+                            ),
+                            "大小": st.column_config.SelectboxColumn(
+                                "大小",
+                                width="small",
+                                options=all_sizes,
+                                required=True,
+                            ),
+                            "甜度": st.column_config.SelectboxColumn(
+                                "甜度",
+                                width="small",
+                                options=SUGAR_OPTS,
+                                required=True,
+                            ),
+                            "冰塊": st.column_config.SelectboxColumn(
+                                "冰塊",
+                                width="small",
+                                options=ICE_OPTS,
+                                required=True,
+                            ),
+                            "價格": st.column_config.NumberColumn(
+                                "價格",
+                                min_value=0,
+                                step=1,
+                                format="$%d",
+                            )
+                        }
                     )
                     
                     if st.button("💾 儲存變更 (Save Changes)", type="primary"):
@@ -465,10 +514,7 @@ if st.sidebar.checkbox("開啟結算功能"):
                             sheet = spreadsheet.get_worksheet(0)
                             sheet.clear()
                             sheet.append_row(standard_headers)
-                            
-                            # 清除快取
                             get_orders_from_sheet.clear()
-                            
                             st.success("✅ 資料已清空，可以開始新的一天了！")
                             st.rerun()
                         except Exception as e:
