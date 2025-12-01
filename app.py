@@ -102,7 +102,7 @@ def get_google_sheet_data():
 # 2. 資料讀取 (菜單、加料 & 訂單) - 含快取機制
 # ==========================================
 
-# 讀取菜單 (快取 60 秒)
+# 讀取菜單 (改良版：更強韌的欄位辨識)
 @st.cache_data(ttl=60)
 def load_menu_from_sheet(_client, sheet_url):
     try:
@@ -111,42 +111,76 @@ def load_menu_from_sheet(_client, sheet_url):
             worksheet = spreadsheet.worksheet("菜單設定")
         except gspread.WorksheetNotFound:
             return None, "找不到「菜單設定」分頁"
+        
+        # 改用 get_all_values 以避免標題重複報錯
+        rows = worksheet.get_all_values()
+        if len(rows) < 2:
+            return None, "菜單分頁沒有資料"
             
-        records = worksheet.get_all_records()
-        cloud_menus = {}
-        for row in records:
-            store = str(row.get("店家", "")).strip()
-            item = str(row.get("品項", "")).strip()
-            price_m = row.get("中杯") or row.get("M")
-            price_l = row.get("大杯") or row.get("L")
-            price_single = row.get("價格")
-            
-            if store and item:
-                if store not in cloud_menus:
-                    cloud_menus[store] = {}
-                item_prices = {}
-                try:
-                    if price_m and int(price_m) > 0: item_prices["中杯"] = int(price_m)
-                except: pass
-                try:
-                    if price_l and int(price_l) > 0: item_prices["大杯"] = int(price_l)
-                except: pass
-                if not item_prices:
-                    try:
-                        if price_single and int(price_single) > 0: item_prices["單一規格"] = int(price_single)
-                    except: pass
-                if not item_prices:
-                    item_prices = {"單一規格": 0}
+        headers = [h.strip() for h in rows[0]]
+        
+        # 輔助函式：找欄位索引
+        def get_col_index(possible_names):
+            for name in possible_names:
+                if name in headers:
+                    return headers.index(name)
+            return -1
 
-                cloud_menus[store][item] = item_prices
-                    
-        if not cloud_menus:
-            return None, "菜單分頁是空的"
+        idx_store = get_col_index(["店家", "Store"])
+        idx_item = get_col_index(["品項", "Item", "飲料"])
+        # 尋找各種可能的標題寫法
+        idx_m = get_col_index(["中杯", "M", "m", "中"])
+        idx_l = get_col_index(["大杯", "L", "l", "大"])
+        idx_price = get_col_index(["價格", "Price", "單一規格"])
+        
+        if idx_store == -1 or idx_item == -1:
+             return None, "找不到「店家」或「品項」欄位，請檢查 Google Sheet 標題。"
+
+        cloud_menus = {}
+        # 從第二列開始讀資料
+        for row in rows[1:]:
+            # 確保該列長度足夠
+            if len(row) <= max(idx_store, idx_item): continue
+            
+            store = row[idx_store].strip()
+            item = row[idx_item].strip()
+            
+            if not store or not item: continue
+            
+            item_prices = {}
+            
+            # 輔助函式：取得並清理價格
+            def get_clean_price(idx):
+                if idx != -1 and idx < len(row):
+                    val = str(row[idx]).replace("$", "").replace(",", "").strip()
+                    if val.isdigit():
+                        return int(val)
+                return None
+
+            p_m = get_clean_price(idx_m)
+            p_l = get_clean_price(idx_l)
+            p_s = get_clean_price(idx_price)
+            
+            # 邏輯：優先使用中/大杯，如果都沒有才用單一價格
+            if p_m: item_prices["中杯"] = p_m
+            if p_l: item_prices["大杯"] = p_l
+            
+            if not item_prices:
+                if p_s: 
+                    item_prices["單一規格"] = p_s
+                else:
+                    item_prices = {"單一規格": 0} # 預設值
+            
+            if store not in cloud_menus:
+                cloud_menus[store] = {}
+            cloud_menus[store][item] = item_prices
+            
         return cloud_menus, None
+
     except Exception as e:
         return None, str(e)
 
-# 讀取加料設定 (快取 60 秒)
+# 讀取加料設定
 @st.cache_data(ttl=60)
 def load_toppings_from_sheet(_client, sheet_url):
     try:
@@ -154,23 +188,32 @@ def load_toppings_from_sheet(_client, sheet_url):
         try:
             worksheet = spreadsheet.worksheet("加料設定")
         except gspread.WorksheetNotFound:
-            return {} # 如果沒有設定加料分頁，回傳空字典，不報錯
+            return {} 
             
-        records = worksheet.get_all_records()
+        rows = worksheet.get_all_values()
+        if len(rows) < 2: return {}
+        
+        headers = [h.strip() for h in rows[0]]
+        
+        # 簡易找欄位
+        try:
+            idx_store = headers.index("店家")
+            idx_name = headers.index("加料品項") if "加料品項" in headers else headers.index("品項")
+            idx_price = headers.index("價格")
+        except:
+            return {}
+
         toppings = {}
-        # 格式: {店家: {加料名: 價格, 加料名2: 價格}}
-        for row in records:
-            store = str(row.get("店家", "")).strip()
-            name = str(row.get("加料品項", "")).strip()
-            price = row.get("價格")
+        for row in rows[1:]:
+            if len(row) <= max(idx_store, idx_name, idx_price): continue
+            store = str(row[idx_store]).strip()
+            name = str(row[idx_name]).strip()
+            price_str = str(row[idx_price]).replace("$", "").replace(",", "").strip()
             
-            if store and name:
+            if store and name and price_str.isdigit():
                 if store not in toppings:
                     toppings[store] = {}
-                try:
-                    toppings[store][name] = int(price)
-                except:
-                    toppings[store][name] = 0
+                toppings[store][name] = int(price_str)
         return toppings
     except Exception:
         return {}
@@ -207,7 +250,6 @@ def generate_pdf_report(df, total_amount):
     elements.append(Paragraph(f"今日總營業額：{total_amount} 元", normal_style))
     elements.append(Spacer(1, 12))
     
-    # 這裡加入 '加料' 欄位到 PDF
     display_cols = ['時間', '姓名', '品項', '大小', '加料', '甜度', '冰塊', '價格', '備註']
     cols = [c for c in display_cols if c in df.columns]
     
@@ -222,7 +264,7 @@ def generate_pdf_report(df, total_amount):
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('INNERGRID', (0, 0), (-1, -1), 0.25, colors.black),
         ('BOX', (0, 0), (-1, -1), 0.25, colors.black),
-        ('FONTSIZE', (0, 0), (-1, -1), 10), # 稍微縮小字體以容納更多欄位
+        ('FONTSIZE', (0, 0), (-1, -1), 10), 
     ]))
     
     elements.append(t)
@@ -287,7 +329,7 @@ with col4:
 with col5:
     ice = st.selectbox("冰塊", ICE_OPTS)
 
-# --- 加料區塊 (新增) ---
+# --- 加料區塊 ---
 topping_price = 0
 selected_toppings = []
 store_toppings_options = all_toppings.get(selected_store, {})
@@ -295,14 +337,10 @@ store_toppings_options = all_toppings.get(selected_store, {})
 if store_toppings_options:
     st.write("---")
     st.markdown("#### 🍬 加料區")
-    # 使用 multiselect 讓使用者可以選多種料
-    # 顯示格式： 珍珠 (+10)
     topping_labels = [f"{name} (+{price})" for name, price in store_toppings_options.items()]
     selected_labels = st.multiselect("選擇配料", topping_labels)
     
-    # 計算加料價格
     for label in selected_labels:
-        # 從 "珍珠 (+10)" 解析出 "珍珠" 和 10
         t_name = label.split(" (+")[0]
         t_price = store_toppings_options[t_name]
         topping_price += t_price
@@ -310,7 +348,6 @@ if store_toppings_options:
 else:
     st.caption("(此店家目前無設定加料選項)")
 
-# 計算總價與顯示
 final_price = base_price + topping_price
 st.write("---")
 st.info(f"💰 **總金額：{final_price} 元** (飲料 {base_price} + 加料 {topping_price})")
@@ -325,7 +362,6 @@ if st.button("送出訂單", type="primary"):
             order_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             topping_str = ", ".join(selected_toppings) if selected_toppings else ""
             
-            # 更新寫入欄位順序，加入加料
             row_data = [
                 order_time, selected_store, name, drink, size, 
                 topping_str, final_price, sugar, ice, note
@@ -397,15 +433,12 @@ if st.sidebar.checkbox("開啟結算功能"):
                     
                     if st.button("🗑️ 清空所有訂單 (歸零)"):
                         try:
-                            # 更新標準標題，加入 加料
                             standard_headers = ['時間', '店家', '姓名', '品項', '大小', '加料', '價格', '甜度', '冰塊', '備註']
                             spreadsheet = client.open_by_url(sheet_url)
                             sheet = spreadsheet.get_worksheet(0)
                             sheet.clear()
                             sheet.append_row(standard_headers)
-                            
                             get_orders_from_sheet.clear()
-                            
                             st.success("✅ 資料已清空，可以開始新的一天了！")
                             st.rerun()
                         except Exception as e:
@@ -428,7 +461,6 @@ try:
         if len(all_values) > 1:
             headers = all_values[0]
             rows = all_values[1:]
-            
             valid_indices = [i for i, h in enumerate(headers) if h.strip()]
             if valid_indices:
                 clean_headers = [headers[i] for i in valid_indices]
@@ -436,7 +468,6 @@ try:
                 for row in rows:
                     clean_row = [row[i] if i < len(row) else "" for i in valid_indices]
                     clean_rows.append(clean_row)
-                
                 df = pd.DataFrame(clean_rows, columns=clean_headers)
                 st.dataframe(df)
         else:
