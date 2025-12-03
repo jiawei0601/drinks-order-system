@@ -4,3 +4,4 @@ gspread
 google-auth
 reportlab
 requests
+google-api-python-client
