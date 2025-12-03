@@ -371,52 +371,14 @@ def upload_to_drive(pdf_bytes, filename, s_info):
     except Exception as e:
         error_str = str(e)
         if "storageQuotaExceeded" in error_str:
-            st.error(f"❌ 上傳失敗：機器人儲存空間已滿！請至管理員專區「Google Drive 維護」進行清理。\n資料夾ID: {folder_id}")
+            # 這是最關鍵的修改：遇到空間不足，不報 Error，改報 Warning 並回傳 None
+            st.warning("⚠️ **上傳略過：機器人帳號無儲存空間** (Google 限制：Service Account 上傳的檔案會佔用機器人自己的額度)。\n程式將繼續執行結算，請使用下方的按鈕下載 PDF。")
+            return None
         elif "File not found" in error_str:
             st.error(f"❌ 上傳失敗：找不到資料夾 ID `{folder_id}`。請確認 ID 正確且機器人有權限。")
         else:
             st.error(f"上傳 Google Drive 失敗: {e}")
         return None
-
-# 清理舊檔案
-def clean_drive_files(s_info):
-    try:
-        service = get_drive_service(s_info)
-        if not service: return False, "認證失敗"
-
-        # 列出所有機器人擁有的 PDF
-        results = service.files().list(
-            q="mimeType='application/pdf' and trashed=false and 'me' in owners",
-            pageSize=100,
-            fields="nextPageToken, files(id, name, size)"
-        ).execute()
-        items = results.get('files', [])
-
-        if not items:
-            return True, "沒有需要清理的檔案"
-
-        count = 0
-        deleted_size = 0
-        for item in items:
-            try:
-                service.files().delete(fileId=item['id']).execute()
-                count += 1
-                deleted_size += int(item.get('size', 0))
-            except: pass
-            
-        mb_freed = round(deleted_size / (1024*1024), 2)
-        return True, f"已刪除 {count} 個檔案，釋放 {mb_freed} MB"
-    except Exception as e:
-        return False, str(e)
-
-# 查詢使用量
-def get_drive_usage(s_info):
-    try:
-        service = get_drive_service(s_info)
-        if not service: return None
-        about = service.about().get(fields="storageQuota").execute()
-        return about['storageQuota']
-    except: return None
 
 # ==========================================
 # 4. 主程式邏輯 (Main UI)
@@ -709,7 +671,7 @@ if admin_mode:
                                 for l in logs:
                                     log_transaction(client, sheet_url, l["name"], l["change"], l["bal"], l["note"])
                                 
-                                # 4. PDF & Drive
+                                # 4. PDF & Drive (改進：上傳失敗不中斷流程)
                                 status_box.info("⏳ 上傳報表中...")
                                 pdf = generate_pdf_report(df, int(total))
                                 fname = f"飲料結算_{datetime.now().strftime('%Y%m%d')}.pdf"
@@ -719,7 +681,8 @@ if admin_mode:
                                 if link:
                                     drive_msg = f"📂 [PDF 已上傳至雲端]({link})"
                                 else:
-                                    drive_msg = "⚠️ PDF 上傳失敗 (請檢查 Secrets: drive_folder_id)"
+                                    # 上傳失敗提示 (但程式會繼續執行下去)
+                                    drive_msg = "⚠️ PDF 上傳略過 (機器人儲存空間不足，請使用下方按鈕手動下載)"
 
                                 # 5. 清空訂單
                                 status_box.info("⏳ 清空訂單中...")
@@ -732,6 +695,14 @@ if admin_mode:
                                 
                                 status_box.success(f"✅ 結算完成！餘額已更新、訂單已清空。")
                                 if link: st.markdown(drive_msg)
+                                
+                                # 提供手動下載按鈕 (以防上傳失敗)
+                                st.download_button(
+                                    label="📄 手動下載 PDF 結算單",
+                                    data=pdf,
+                                    file_name=fname,
+                                    mime='application/pdf',
+                                )
                                 
                                 if st.button("🔄 重新整理頁面"): st.rerun()
                             else:
@@ -748,34 +719,6 @@ if admin_mode:
                     st.dataframe(pd.DataFrame(b_data).sort_values("存款餘額"), use_container_width=True)
                 else:
                     st.write("無資料")
-                    
-            # --- D. Google Drive 維護 (新功能) ---
-            st.divider()
-            with st.expander("🛠️ Google Drive 空間維護 (解決上傳失敗問題)"):
-                st.warning("若出現「機器人無儲存空間」錯誤，請在此清理舊檔案。機器人上傳的檔案會佔用它自己的 15GB 配額。")
-                
-                # 顯示目前的 Folder ID
-                curr_fid = get_folder_id(s_info)
-                st.text(f"目前設定的資料夾 ID: {curr_fid}")
-                
-                if st.button("🔍 檢查機器人空間使用量"):
-                    quota = get_drive_usage(s_info)
-                    if quota:
-                        used = int(quota.get('usage', 0)) / (1024*1024*1024)
-                        limit = int(quota.get('limit', 15*1024*1024*1024)) / (1024*1024*1024)
-                        st.write(f"已使用: {used:.2f} GB / 共 {limit:.2f} GB")
-                        if used > 14:
-                            st.error("⚠️ 空間即將額滿！")
-                        else:
-                            st.success("✅ 空間充足")
-                    else:
-                        st.error("無法取得資訊")
-                
-                if st.button("🗑️ 清理機器人擁有的舊 PDF 檔案 (保留資料夾內檔案，僅刪機器人建立的)"):
-                    with st.spinner("清理中..."):
-                        ok, msg = clean_drive_files(s_info)
-                        if ok: st.success(msg)
-                        else: st.error(f"清理失敗: {msg}")
 
     else:
         st.info("📭 目前訂單列表是空的")
