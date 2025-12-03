@@ -266,6 +266,24 @@ def get_orders_from_sheet(_client, sheet_url):
     except Exception:
         return []
 
+# 新增交易紀錄 (Log)
+def log_transaction(_client, sheet_url, name, amount_change, new_balance, note=""):
+    try:
+        spreadsheet = _client.open_by_url(sheet_url)
+        try:
+            wks_log = spreadsheet.worksheet("交易紀錄")
+        except gspread.WorksheetNotFound:
+            # 如果沒有交易紀錄分頁，則建立一個
+            wks_log = spreadsheet.add_worksheet(title="交易紀錄", rows=1000, cols=5)
+            wks_log.append_row(["時間", "姓名", "變動金額", "變動後餘額", "備註"])
+            
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        wks_log.append_row([timestamp, name, amount_change, new_balance, note])
+        return True
+    except Exception as e:
+        print(f"Log Error: {e}")
+        return False
+
 # ==========================================
 # 3. PDF 生成函式
 # ==========================================
@@ -606,8 +624,21 @@ if st.sidebar.checkbox("開啟結算功能"):
                                 try:
                                     # 1. 準備要更新的資料對應表 {姓名: 新餘額}
                                     update_map = {}
+                                    changes_log = [] # 用來記錄變動，寫入 Log
                                     for index, row in edited_balance_df.iterrows():
-                                        update_map[row['姓名']] = row['扣款後餘額']
+                                        new_balance = row['扣款後餘額']
+                                        update_map[row['姓名']] = new_balance
+                                        
+                                        # 計算變動金額 (負數代表扣款)
+                                        old_balance = row['目前存款']
+                                        diff = new_balance - old_balance
+                                        if diff != 0:
+                                            changes_log.append({
+                                                "name": row['姓名'],
+                                                "change": diff,
+                                                "balance": new_balance,
+                                                "note": f"訂單扣款 (消費 {row['今日消費']})"
+                                            })
                                     
                                     # 2. 讀取目前的儲值表
                                     spreadsheet = client.open_by_url(sheet_url)
@@ -656,9 +687,13 @@ if st.sidebar.checkbox("開啟結算功能"):
                                                 new_row[idx_val] = str(bal)
                                                 all_rows.append(new_row)
                                         
-                                        # 4. 寫回
+                                        # 4. 寫回儲值表
                                         wks_balance.clear()
                                         wks_balance.update(values=all_rows)
+                                        
+                                        # 5. 寫入交易紀錄 Log (新增功能)
+                                        for log in changes_log:
+                                            log_transaction(client, sheet_url, log["name"], log["change"], log["balance"], log["note"])
                                         
                                         load_balances_from_sheet.clear()
                                         st.success("✅ 儲值表餘額已更新完成！")
@@ -669,6 +704,30 @@ if st.sidebar.checkbox("開啟結算功能"):
 
                         else:
                             st.caption("今日尚未有訂單，無法計算扣款。")
+                            
+                    # --- 顯示所有人員儲值資料 (新增功能) ---
+                    st.write("---")
+                    st.markdown("### 📋 所有人員儲值明細")
+                    if balances:
+                        # 將字典轉為 DataFrame 顯示，包含負數
+                        all_balance_data = [{"姓名": k, "存款餘額": v} for k, v in balances.items()]
+                        all_balance_df = pd.DataFrame(all_balance_data)
+                        
+                        # 簡單排序 (餘額低的在前面，方便追債 XD)
+                        all_balance_df = all_balance_df.sort_values(by="存款餘額")
+                        
+                        st.dataframe(
+                            all_balance_df,
+                            use_container_width=True,
+                            column_config={
+                                "存款餘額": st.column_config.NumberColumn(
+                                    "存款餘額",
+                                    format="$%d"
+                                )
+                            }
+                        )
+                    else:
+                        st.info("尚無儲值資料。")
                     
                     st.write("---")
                     
