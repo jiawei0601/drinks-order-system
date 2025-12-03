@@ -16,6 +16,10 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from io import BytesIO
 
+# Google Drive 相關套件
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+
 # ==========================================
 # 0. PDF 字型設定 (解決中文亂碼問題)
 # ==========================================
@@ -23,7 +27,7 @@ from io import BytesIO
 def setup_chinese_font():
     font_path = "chinese_font.ttf"
     url_primary = "https://raw.githubusercontent.com/justfont/open-huninn-font/master/font/jf-openhuninn-1.1.ttf"
-    url_backup = "https://github.com/google/fonts/raw/main/ofl/notosanstc/NotoSansTC%5Bwght%5D.ttf"
+    url_backup = "https://github.com/google/fonts/raw/main/ofl/notosanstc/static/NotoSansTC-Regular.ttf"
     
     def download_font(url):
         try:
@@ -285,7 +289,7 @@ def log_transaction(_client, sheet_url, name, amount_change, new_balance, note="
         return False
 
 # ==========================================
-# 3. PDF 生成函式
+# 3. PDF 生成與上傳 Drive
 # ==========================================
 def generate_pdf_report(df, total_amount):
     buffer = BytesIO()
@@ -306,7 +310,6 @@ def generate_pdf_report(df, total_amount):
     elements.append(Paragraph(f"今日總營業額：{total_amount} 元", normal_style))
     elements.append(Spacer(1, 12))
     
-    # 定義要匯出到 PDF 的欄位
     display_cols = ['時間', '姓名', '品項', '大小', '加料', '甜度', '冰塊', '價格', '備註']
     cols = [c for c in display_cols if c in df.columns]
     
@@ -328,6 +331,51 @@ def generate_pdf_report(df, total_amount):
     doc.build(elements)
     buffer.seek(0)
     return buffer
+
+def upload_pdf_to_drive(pdf_bytes, filename, s_info):
+    """將 PDF 上傳到指定的 Google Drive 資料夾"""
+    try:
+        # 重建憑證 (為了 Drive API)
+        private_key = s_info["private_key"]
+        if "\\n" in private_key: private_key = private_key.replace("\\n", "\n")
+        
+        creds_dict = {
+            "type": s_info["type"],
+            "project_id": s_info["project_id"],
+            "private_key_id": s_info["private_key_id"],
+            "private_key": private_key,
+            "client_email": s_info["client_email"],
+            "client_id": s_info["client_id"],
+            "auth_uri": s_info.get("auth_uri", "https://accounts.google.com/o/oauth2/auth"),
+            "token_uri": s_info.get("token_uri", "https://oauth2.googleapis.com/token"),
+            "auth_provider_x509_cert_url": s_info.get("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs"),
+            "client_x509_cert_url": s_info["client_x509_cert_url"]
+        }
+        scopes = ['https://www.googleapis.com/auth/drive']
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        
+        # 建立 Drive Service
+        service = build('drive', 'v3', credentials=creds)
+        
+        # 取得目標資料夾 ID
+        folder_id = None
+        if "drive_folder_id" in st.secrets:
+            folder_id = st.secrets["drive_folder_id"]
+        elif "drive" in st.secrets and "folder_id" in st.secrets["drive"]:
+            folder_id = st.secrets["drive"]["folder_id"]
+            
+        file_metadata = {'name': filename}
+        if folder_id:
+            file_metadata['parents'] = [folder_id]
+        
+        media = MediaIoBaseUpload(pdf_bytes, mimetype='application/pdf', resumable=True)
+        
+        file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        return file.get('webViewLink')
+        
+    except Exception as e:
+        st.error(f"上傳 Google Drive 失敗: {e}")
+        return None
 
 DEFAULT_MENUS = {"範例店家": {"紅茶": {"單一規格": 30}}}
 SUGAR_OPTS = ["正常糖", "少糖 (8分)", "半糖 (5分)", "微糖 (3分)", "一分糖", "無糖"]
@@ -481,7 +529,7 @@ if st.sidebar.checkbox("開啟結算功能"):
                     
                     st.metric("💵 今日總營業額", f"{int(total_amount)} 元")
                     
-                    # --- 編輯區塊 (升級版：加入下拉選單) ---
+                    # --- 編輯區塊 ---
                     st.markdown("### ✏️ 訂單管理與編輯")
                     st.caption("您可以直接點擊表格修改內容，或選取左側方框刪除列。修改完請務必按下方「儲存變更」。")
                     
@@ -501,14 +549,12 @@ if st.sidebar.checkbox("開啟結算功能"):
                         column_config={
                             "店家": st.column_config.SelectboxColumn(
                                 "店家",
-                                help="選擇店家",
                                 width="medium",
                                 options=all_stores,
                                 required=True,
                             ),
                             "品項": st.column_config.SelectboxColumn(
                                 "品項",
-                                help="選擇飲料",
                                 width="medium",
                                 options=all_items,
                                 required=True,
@@ -542,7 +588,6 @@ if st.sidebar.checkbox("開啟結算功能"):
                     
                     if st.button("💾 儲存變更 (Save Changes)", type="primary"):
                         try:
-                            # 準備寫入的資料
                             updated_headers = edited_df.columns.tolist()
                             updated_values = edited_df.astype(str).values.tolist()
                             all_data = [updated_headers] + updated_values
@@ -553,9 +598,7 @@ if st.sidebar.checkbox("開啟結算功能"):
                             sheet.clear()
                             sheet.update(values=all_data)
                             
-                            # 清除快取
                             get_orders_from_sheet.clear()
-                            
                             st.success("✅ 訂單已更新成功！")
                             st.rerun()
                         except Exception as e:
@@ -563,20 +606,17 @@ if st.sidebar.checkbox("開啟結算功能"):
                     
                     st.write("---")
                     
-                    # --- 餘額扣款試算 (新增功能) ---
+                    # --- 餘額扣款試算 ---
                     st.markdown("### 💰 餘額扣款試算")
                     
-                    # 1. 讀取存款
                     balances = load_balances_from_sheet(client, sheet_url)
                     
                     if balances is None:
-                        st.info("💡 尚未設定「會員儲值」分頁。若需使用扣款功能，請在 Google Sheet 新增分頁並設定「姓名」、「存款餘額」欄位。")
+                        st.info("💡 尚未設定「會員儲值」分頁。")
                     elif '姓名' in df.columns and '價格' in df.columns:
-                        # 2. 計算每人今日消費
                         spending = df.groupby('姓名')['價格'].sum().reset_index()
                         spending.columns = ['姓名', '今日消費']
                         
-                        # 3. 合併存款資料
                         report_data = []
                         for _, row in spending.iterrows():
                             name = row['姓名']
@@ -609,27 +649,26 @@ if st.sidebar.checkbox("開啟結算功能"):
                                 column_config={
                                     "扣款後餘額": st.column_config.NumberColumn(
                                         "扣款後餘額 (可編輯)",
-                                        help="修改此數值將會更新到儲值表",
+                                        help="修改數值將更新到儲值表",
                                         required=True,
                                         step=1
                                     ),
-                                    "狀態": st.column_config.TextColumn(
-                                        "狀態",
-                                        width="small"
-                                    )
+                                    "狀態": st.column_config.TextColumn("狀態", width="small")
                                 }
                             )
                             
                             if st.button("💸 確認扣款並更新儲值表 (Update Deposit)", type="primary"):
                                 try:
-                                    # 1. 準備要更新的資料對應表 {姓名: 新餘額}
+                                    status_container = st.empty()
+                                    status_container.info("⏳ 處理中：正在更新餘額與記錄交易...")
+                                    
+                                    # 1. 準備資料
                                     update_map = {}
-                                    changes_log = [] # 用來記錄變動，寫入 Log
+                                    changes_log = [] 
                                     for index, row in edited_balance_df.iterrows():
                                         new_balance = row['扣款後餘額']
                                         update_map[row['姓名']] = new_balance
                                         
-                                        # 計算變動金額 (負數代表扣款)
                                         old_balance = row['目前存款']
                                         diff = new_balance - old_balance
                                         if diff != 0:
@@ -640,7 +679,7 @@ if st.sidebar.checkbox("開啟結算功能"):
                                                 "note": f"訂單扣款 (消費 {row['今日消費']})"
                                             })
                                     
-                                    # 2. 讀取目前的儲值表
+                                    # 2. 讀取儲值表
                                     spreadsheet = client.open_by_url(sheet_url)
                                     try:
                                         wks_balance = spreadsheet.worksheet("會員儲值")
@@ -648,12 +687,9 @@ if st.sidebar.checkbox("開啟結算功能"):
                                         st.error("找不到「會員儲值」分頁，無法更新。")
                                         st.stop()
                                     
-                                    # 3. 讀取所有資料並更新
+                                    # 3. 更新邏輯
                                     all_rows = wks_balance.get_all_values()
-                                    
-                                    if len(all_rows) < 1:
-                                        all_rows = [["姓名", "存款餘額"]]
-                                        
+                                    if len(all_rows) < 1: all_rows = [["姓名", "存款餘額"]]
                                     headers = all_rows[0]
                                     
                                     def find_col(keywords):
@@ -665,21 +701,18 @@ if st.sidebar.checkbox("開啟結算功能"):
                                     idx_val = find_col(["存款餘額", "餘額", "存款", "Balance", "金額", "目前餘額"])
                                     
                                     if idx_name == -1 or idx_val == -1:
-                                        st.error("儲值表欄位辨識失敗，請確認有「姓名」與「存款餘額」欄位。")
+                                        st.error("儲值表欄位辨識失敗。")
                                     else:
                                         updated_names = set()
-                                        # 更新現有資料
                                         for i in range(1, len(all_rows)):
                                             row = all_rows[i]
                                             if len(row) > idx_name:
                                                 r_name = row[idx_name].strip()
                                                 if r_name in update_map:
-                                                    while len(row) <= idx_val:
-                                                        row.append("")
+                                                    while len(row) <= idx_val: row.append("")
                                                     row[idx_val] = str(update_map[r_name])
                                                     updated_names.add(r_name)
                                         
-                                        # 處理新使用者
                                         for name, bal in update_map.items():
                                             if name not in updated_names:
                                                 new_row = [""] * (max(idx_name, idx_val) + 1)
@@ -687,17 +720,42 @@ if st.sidebar.checkbox("開啟結算功能"):
                                                 new_row[idx_val] = str(bal)
                                                 all_rows.append(new_row)
                                         
-                                        # 4. 寫回儲值表
                                         wks_balance.clear()
                                         wks_balance.update(values=all_rows)
                                         
-                                        # 5. 寫入交易紀錄 Log (新增功能)
                                         for log in changes_log:
                                             log_transaction(client, sheet_url, log["name"], log["change"], log["balance"], log["note"])
                                         
+                                        # 6. 生成 PDF 並上傳 Google Drive
+                                        status_container.info("⏳ 處理中：正在生成 PDF 並上傳 Google Drive...")
+                                        pdf_bytes = generate_pdf_report(df, int(total_amount))
+                                        filename = f"飲料結算_{datetime.now().strftime('%Y%m%d')}.pdf"
+                                        
+                                        drive_link = upload_pdf_to_drive(pdf_bytes, filename, s_info)
+                                        
+                                        drive_msg = ""
+                                        if drive_link:
+                                            drive_msg = f"📂 [PDF 已上傳至雲端]({drive_link})"
+                                        else:
+                                            drive_msg = "⚠️ PDF 上傳失敗 (請檢查 Secrets)"
+                                        
+                                        # 7. 清空訂單
+                                        status_container.info("⏳ 處理中：正在清空訂單...")
+                                        standard_headers = ['時間', '店家', '姓名', '品項', '大小', '加料', '價格', '甜度', '冰塊', '備註']
+                                        sheet_order = spreadsheet.get_worksheet(0)
+                                        sheet_order.clear()
+                                        sheet_order.append_row(standard_headers)
+                                        
                                         load_balances_from_sheet.clear()
-                                        st.success("✅ 儲值表餘額已更新完成！")
-                                        st.rerun()
+                                        get_orders_from_sheet.clear()
+                                        
+                                        status_container.success(f"✅ 完成！餘額已更新、訂單已清空。")
+                                        if drive_link:
+                                            st.markdown(drive_msg)
+                                        
+                                        # 不立即 rerun，讓使用者看到連結
+                                        if st.button("🔄 重新整理頁面"):
+                                            st.rerun()
                                         
                                 except Exception as e:
                                     st.error(f"更新失敗：{e}")
@@ -705,55 +763,18 @@ if st.sidebar.checkbox("開啟結算功能"):
                         else:
                             st.caption("今日尚未有訂單，無法計算扣款。")
                             
-                    # --- 顯示所有人員儲值資料 (新增功能) ---
+                    # --- 顯示所有人員儲值資料 ---
                     st.write("---")
                     st.markdown("### 📋 所有人員儲值明細")
                     if balances:
-                        # 將字典轉為 DataFrame 顯示，包含負數
                         all_balance_data = [{"姓名": k, "存款餘額": v} for k, v in balances.items()]
                         all_balance_df = pd.DataFrame(all_balance_data)
-                        
-                        # 簡單排序 (餘額低的在前面，方便追債 XD)
                         all_balance_df = all_balance_df.sort_values(by="存款餘額")
-                        
-                        st.dataframe(
-                            all_balance_df,
-                            use_container_width=True,
-                            column_config={
-                                "存款餘額": st.column_config.NumberColumn(
-                                    "存款餘額",
-                                    format="$%d"
-                                )
-                            }
-                        )
+                        st.dataframe(all_balance_df, use_container_width=True, column_config={"存款餘額": st.column_config.NumberColumn("存款餘額", format="$%d")})
                     else:
                         st.info("尚無儲值資料。")
                     
                     st.write("---")
-                    
-                    pdf_bytes = generate_pdf_report(df, int(total_amount))
-                    st.download_button(
-                        label="📄 下載 PDF 結算單",
-                        data=pdf_bytes,
-                        file_name=f"飲料結算_{datetime.now().strftime('%Y%m%d')}.pdf",
-                        mime='application/pdf',
-                    )
-                    
-                    st.write("---")
-                    st.warning("⚠️ **危險操作區**")
-                    
-                    if st.button("🗑️ 清空所有訂單 (歸零)"):
-                        try:
-                            standard_headers = ['時間', '店家', '姓名', '品項', '大小', '加料', '價格', '甜度', '冰塊', '備註']
-                            spreadsheet = client.open_by_url(sheet_url)
-                            sheet = spreadsheet.get_worksheet(0)
-                            sheet.clear()
-                            sheet.append_row(standard_headers)
-                            get_orders_from_sheet.clear()
-                            st.success("✅ 資料已清空，可以開始新的一天了！")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"清空失敗：{e}")
             else:
                 st.info("📭 目前是空的，沒有訂單。")
     except Exception as e:
