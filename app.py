@@ -248,6 +248,45 @@ def get_orders_from_sheet(_client, sheet_url):
 # 3. 功能操作層 (Actions Layer)
 # ==========================================
 
+# 取得 Drive Service (重構以共用)
+def get_drive_service(s_info):
+    try:
+        private_key = s_info["private_key"].replace("\\n", "\n")
+        creds_dict = {
+            "type": s_info["type"],
+            "project_id": s_info["project_id"],
+            "private_key_id": s_info["private_key_id"],
+            "private_key": private_key,
+            "client_email": s_info["client_email"],
+            "client_id": s_info["client_id"],
+            "auth_uri": s_info.get("auth_uri", "https://accounts.google.com/o/oauth2/auth"),
+            "token_uri": s_info.get("token_uri", "https://oauth2.googleapis.com/token"),
+            "auth_provider_x509_cert_url": s_info.get("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs"),
+            "client_x509_cert_url": s_info["client_x509_cert_url"]
+        }
+        scopes = ['https://www.googleapis.com/auth/drive']
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        service = build('drive', 'v3', credentials=creds)
+        return service
+    except Exception as e:
+        print(f"Drive Service Error: {e}")
+        return None
+
+# 取得 Folder ID
+def get_folder_id(s_info):
+    folder_id = None
+    # A. 找全域設定
+    if "drive_folder_id" in st.secrets:
+        folder_id = st.secrets["drive_folder_id"]
+    # B. 找 [drive] 區塊
+    elif "drive" in st.secrets and "folder_id" in st.secrets["drive"]:
+        folder_id = st.secrets["drive"].get("folder_id")
+    # C. 找 s_info
+    elif s_info:
+        try: folder_id = s_info.get("drive_folder_id")
+        except: pass
+    return folder_id
+
 # 寫入交易紀錄
 def log_transaction(_client, sheet_url, name, amount_change, new_balance, note=""):
     try:
@@ -308,46 +347,15 @@ def generate_pdf_report(df, total_amount):
 # 上傳 Google Drive
 def upload_to_drive(pdf_bytes, filename, s_info):
     try:
-        # 1. 檢查 Folder ID (增強版：支援多種 Secrets 位置)
-        folder_id = None
-        
-        # A. 找全域設定 (最外層)
-        if "drive_folder_id" in st.secrets:
-            folder_id = st.secrets["drive_folder_id"]
-        
-        # B. 找 [drive] 區塊
-        elif "drive" in st.secrets and "folder_id" in st.secrets["drive"]:
-            folder_id = st.secrets["drive"].get("folder_id")
-            
-        # C. 找 [connections.gsheets] 區塊 (即 s_info)
-        # 修正：移除 isinstance 檢查，直接嘗試讀取
-        elif s_info:
-            try:
-                folder_id = s_info.get("drive_folder_id")
-            except:
-                pass
-            
+        folder_id = get_folder_id(s_info)
         if not folder_id:
             st.error("❌ 上傳失敗：找不到 `drive_folder_id`。請確認 Secrets 設定位置。")
             return None
 
-        # 2. 重建憑證
-        private_key = s_info["private_key"].replace("\\n", "\n")
-        creds_dict = {
-            "type": s_info["type"],
-            "project_id": s_info["project_id"],
-            "private_key_id": s_info["private_key_id"],
-            "private_key": private_key,
-            "client_email": s_info["client_email"],
-            "client_id": s_info["client_id"],
-            "auth_uri": s_info.get("auth_uri", "https://accounts.google.com/o/oauth2/auth"),
-            "token_uri": s_info.get("token_uri", "https://oauth2.googleapis.com/token"),
-            "auth_provider_x509_cert_url": s_info.get("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs"),
-            "client_x509_cert_url": s_info["client_x509_cert_url"]
-        }
-        scopes = ['https://www.googleapis.com/auth/drive']
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        service = build('drive', 'v3', credentials=creds)
+        service = get_drive_service(s_info)
+        if not service:
+            st.error("❌ Google Drive 認證失敗")
+            return None
         
         # 3. 上傳
         file_metadata = {'name': filename, 'parents': [folder_id]}
@@ -363,12 +371,52 @@ def upload_to_drive(pdf_bytes, filename, s_info):
     except Exception as e:
         error_str = str(e)
         if "storageQuotaExceeded" in error_str:
-            st.error(f"❌ 上傳失敗：機器人無儲存空間，請確認資料夾ID `{folder_id}` 正確並已共用(編輯者)。")
+            st.error(f"❌ 上傳失敗：機器人儲存空間已滿！請至管理員專區「Google Drive 維護」進行清理。\n資料夾ID: {folder_id}")
         elif "File not found" in error_str:
             st.error(f"❌ 上傳失敗：找不到資料夾 ID `{folder_id}`。請確認 ID 正確且機器人有權限。")
         else:
             st.error(f"上傳 Google Drive 失敗: {e}")
         return None
+
+# 清理舊檔案
+def clean_drive_files(s_info):
+    try:
+        service = get_drive_service(s_info)
+        if not service: return False, "認證失敗"
+
+        # 列出所有機器人擁有的 PDF
+        results = service.files().list(
+            q="mimeType='application/pdf' and trashed=false and 'me' in owners",
+            pageSize=100,
+            fields="nextPageToken, files(id, name, size)"
+        ).execute()
+        items = results.get('files', [])
+
+        if not items:
+            return True, "沒有需要清理的檔案"
+
+        count = 0
+        deleted_size = 0
+        for item in items:
+            try:
+                service.files().delete(fileId=item['id']).execute()
+                count += 1
+                deleted_size += int(item.get('size', 0))
+            except: pass
+            
+        mb_freed = round(deleted_size / (1024*1024), 2)
+        return True, f"已刪除 {count} 個檔案，釋放 {mb_freed} MB"
+    except Exception as e:
+        return False, str(e)
+
+# 查詢使用量
+def get_drive_usage(s_info):
+    try:
+        service = get_drive_service(s_info)
+        if not service: return None
+        about = service.about().get(fields="storageQuota").execute()
+        return about['storageQuota']
+    except: return None
 
 # ==========================================
 # 4. 主程式邏輯 (Main UI)
@@ -700,6 +748,34 @@ if admin_mode:
                     st.dataframe(pd.DataFrame(b_data).sort_values("存款餘額"), use_container_width=True)
                 else:
                     st.write("無資料")
+                    
+            # --- D. Google Drive 維護 (新功能) ---
+            st.divider()
+            with st.expander("🛠️ Google Drive 空間維護 (解決上傳失敗問題)"):
+                st.warning("若出現「機器人無儲存空間」錯誤，請在此清理舊檔案。機器人上傳的檔案會佔用它自己的 15GB 配額。")
+                
+                # 顯示目前的 Folder ID
+                curr_fid = get_folder_id(s_info)
+                st.text(f"目前設定的資料夾 ID: {curr_fid}")
+                
+                if st.button("🔍 檢查機器人空間使用量"):
+                    quota = get_drive_usage(s_info)
+                    if quota:
+                        used = int(quota.get('usage', 0)) / (1024*1024*1024)
+                        limit = int(quota.get('limit', 15*1024*1024*1024)) / (1024*1024*1024)
+                        st.write(f"已使用: {used:.2f} GB / 共 {limit:.2f} GB")
+                        if used > 14:
+                            st.error("⚠️ 空間即將額滿！")
+                        else:
+                            st.success("✅ 空間充足")
+                    else:
+                        st.error("無法取得資訊")
+                
+                if st.button("🗑️ 清理機器人擁有的舊 PDF 檔案 (保留資料夾內檔案，僅刪機器人建立的)"):
+                    with st.spinner("清理中..."):
+                        ok, msg = clean_drive_files(s_info)
+                        if ok: st.success(msg)
+                        else: st.error(f"清理失敗: {msg}")
 
     else:
         st.info("📭 目前訂單列表是空的")
