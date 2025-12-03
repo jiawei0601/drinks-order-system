@@ -308,15 +308,27 @@ def generate_pdf_report(df, total_amount):
 # 上傳 Google Drive
 def upload_to_drive(pdf_bytes, filename, s_info):
     try:
-        # 1. 檢查 Folder ID
-        folder_id = st.secrets.get("drive_folder_id")
-        if not folder_id:
-            folder_id = st.secrets.get("drive", {}).get("folder_id")
-        if not folder_id and isinstance(s_info, dict):
-            folder_id = s_info.get("drive_folder_id")
+        # 1. 檢查 Folder ID (增強版：支援多種 Secrets 位置)
+        folder_id = None
+        
+        # A. 找全域設定 (最外層)
+        if "drive_folder_id" in st.secrets:
+            folder_id = st.secrets["drive_folder_id"]
+        
+        # B. 找 [drive] 區塊
+        elif "drive" in st.secrets and "folder_id" in st.secrets["drive"]:
+            folder_id = st.secrets["drive"].get("folder_id")
+            
+        # C. 找 [connections.gsheets] 區塊 (即 s_info)
+        # 修正：移除 isinstance 檢查，直接嘗試讀取
+        elif s_info:
+            try:
+                folder_id = s_info.get("drive_folder_id")
+            except:
+                pass
             
         if not folder_id:
-            st.error("❌ 上傳失敗：未設定 `drive_folder_id`。請去 Streamlit Cloud 的 Secrets 補上資料夾 ID。")
+            st.error("❌ 上傳失敗：找不到 `drive_folder_id`。請確認 Secrets 設定位置。")
             return None
 
         # 2. 重建憑證
@@ -618,10 +630,10 @@ if admin_mode:
                             h_bal = bal_rows[0]
                             try:
                                 i_n = -1
-                                for k in ["姓名", "Name"]: 
+                                for k in ["姓名", "Name", "員工", "員工姓名"]: 
                                     if k in h_bal: i_n = h_bal.index(k)
                                 i_b = -1
-                                for k in ["存款餘額", "餘額"]: 
+                                for k in ["存款餘額", "餘額", "存款", "Balance", "金額", "目前餘額"]: 
                                     if k in h_bal: i_b = h_bal.index(k)
                             except: i_n, i_b = -1, -1
                             
