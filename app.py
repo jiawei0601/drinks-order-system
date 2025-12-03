@@ -257,8 +257,8 @@ def log_transaction(_client, sheet_url, name, amount_change, new_balance, note="
         print(f"Log Error: {e}")
         return False
 
-# 產生 PDF
-def generate_pdf(df, total_amount):
+# 產生 PDF (修正函式名稱以匹配呼叫)
+def generate_pdf_report(df, total_amount):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     elements = []
