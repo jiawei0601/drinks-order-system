@@ -4,7 +4,7 @@ from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 
-# PDF 相關套件
+# PDF 相關
 import requests
 import os
 from reportlab.lib.pagesizes import A4
@@ -16,57 +16,65 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from io import BytesIO
 
-# Google Drive 相關套件
+# Google Drive 相關
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # ==========================================
-# 0. PDF 字型設定 (解決中文亂碼問題)
+# 1. 核心設定與初始化
 # ==========================================
+st.set_page_config(page_title="辦公室飲料點餐系統", page_icon="🥤", layout="wide")
+
+# 設定常數
+DEFAULT_MENUS = {"範例店家": {"紅茶": {"單一規格": 30}}}
+SUGAR_OPTS = ["正常糖", "少糖 (8分)", "半糖 (5分)", "微糖 (3分)", "一分糖", "無糖"]
+ICE_OPTS = ["正常冰", "少冰", "微冰", "去冰", "常溫", "熱"]
+
+# 初始化字型 (快取資源)
 @st.cache_resource
 def setup_chinese_font():
     font_path = "chinese_font.ttf"
-    url_primary = "https://raw.githubusercontent.com/justfont/open-huninn-font/master/font/jf-openhuninn-1.1.ttf"
-    url_backup = "https://github.com/google/fonts/raw/main/ofl/notosanstc/static/NotoSansTC-Regular.ttf"
+    # 優先使用 Open Huninn (粉圓體)，備用 Google Noto Sans TC
+    urls = [
+        "https://raw.githubusercontent.com/justfont/open-huninn-font/master/font/jf-openhuninn-1.1.ttf",
+        "https://github.com/google/fonts/raw/main/ofl/notosanstc/static/NotoSansTC-Regular.ttf"
+    ]
     
-    def download_font(url):
-        try:
-            response = requests.get(url, timeout=15)
-            if response.status_code == 200:
-                if len(response.content) < 1000 or response.content.startswith(b"<") or response.content.startswith(b"\n"):
-                    return False
-                with open(font_path, "wb") as f:
-                    f.write(response.content)
-                return True
-            return False
-        except:
-            return False
-
+    # 檢查並下載字型
     if not os.path.exists(font_path):
-        with st.spinner("正在下載中文字型以支援 PDF (第一次需約 10 秒)..."):
-            if not download_font(url_primary):
-                if not download_font(url_backup):
-                    st.error("⚠️ 無法下載中文字型，PDF 報表可能會顯示亂碼。")
-                    return None
+        with st.spinner("正在初始化系統字型 (第一次需約 10 秒)..."):
+            downloaded = False
+            for url in urls:
+                try:
+                    response = requests.get(url, timeout=15)
+                    if response.status_code == 200 and len(response.content) > 1000 and not response.content.startswith(b"<"):
+                        with open(font_path, "wb") as f:
+                            f.write(response.content)
+                        downloaded = True
+                        break
+                except:
+                    continue
+            
+            if not downloaded:
+                st.error("⚠️ 無法下載中文字型，PDF 報表可能會顯示亂碼。")
+                return None
+
     try:
         pdfmetrics.registerFont(TTFont('ChineseFont', font_path))
         return 'ChineseFont'
-    except Exception as e:
-        if os.path.exists(font_path):
-            os.remove(font_path)
-        st.warning(f"字型載入異常 ({e})，請重新整理頁面試試。")
+    except Exception:
+        if os.path.exists(font_path): os.remove(font_path)
         return None
 
-# ==========================================
-# 1. Google Sheets 連線設定
-# ==========================================
+# 初始化 Google Sheet 連線 (快取資源)
 @st.cache_resource
-def get_google_sheet_data():
+def get_google_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
     try:
+        # 取得 Secrets
         if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
             s_info = st.secrets["connections"]["gsheets"]
         elif "type" in st.secrets and "project_id" in st.secrets:
@@ -74,10 +82,10 @@ def get_google_sheet_data():
         else:
             raise ValueError("找不到憑證！請確認 Secrets 設定。")
 
-        private_key = s_info["private_key"]
-        if "\\n" in private_key:
-            private_key = private_key.replace("\\n", "\n")
+        # 修復 Private Key
+        private_key = s_info["private_key"].replace("\\n", "\n")
 
+        # 建立憑證
         creds_dict = {
             "type": s_info["type"],
             "project_id": s_info["project_id"],
@@ -94,222 +102,182 @@ def get_google_sheet_data():
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(creds)
         return client, s_info
-
-    except KeyError as e:
-        st.error(f"❌ Secrets 設定缺少必要欄位：{e}")
-        st.stop()
     except Exception as e:
-        st.error(f"❌ Google 連線發生錯誤：{e}")
+        st.error(f"連線設定錯誤: {e}")
         st.stop()
 
 # ==========================================
-# 2. 資料讀取 (菜單、加料、訂單 & 存款) - 含快取機制
+# 2. 資料讀取層 (Data Access Layer)
 # ==========================================
 
-# 讀取菜單
+# 讀取菜單 (快取 60s)
 @st.cache_data(ttl=60)
-def load_menu_from_sheet(_client, sheet_url):
+def load_menu(_client, sheet_url):
     try:
         spreadsheet = _client.open_by_url(sheet_url)
-        try:
-            worksheet = spreadsheet.worksheet("菜單設定")
-        except gspread.WorksheetNotFound:
-            return None, "找不到「菜單設定」分頁"
-        
+        worksheet = spreadsheet.worksheet("菜單設定")
         rows = worksheet.get_all_values()
-        if len(rows) < 2:
-            return None, "菜單分頁沒有資料"
-            
+        if len(rows) < 2: return None, "無資料"
+        
         headers = [h.strip() for h in rows[0]]
         
-        def get_col_index(possible_names):
-            for name in possible_names:
-                if name in headers:
-                    return headers.index(name)
+        # 欄位對應
+        def find_idx(candidates):
+            for c in candidates:
+                if c in headers: return headers.index(c)
             return -1
-
-        idx_store = get_col_index(["店家", "Store"])
-        idx_item = get_col_index(["品項", "Item", "飲料"])
-        idx_m = get_col_index(["中杯", "M", "m", "中"])
-        idx_l = get_col_index(["大杯", "L", "l", "大"])
-        idx_price = get_col_index(["價格", "Price", "單一規格"])
+            
+        idx_store = find_idx(["店家", "Store"])
+        idx_item = find_idx(["品項", "Item"])
+        idx_m = find_idx(["中杯", "M", "m"])
+        idx_l = find_idx(["大杯", "L", "l"])
+        idx_p = find_idx(["價格", "Price"])
         
-        if idx_store == -1 or idx_item == -1:
-             return None, "找不到「店家」或「品項」欄位，請檢查 Google Sheet 標題。"
+        if idx_store == -1 or idx_item == -1: return None, "欄位對應失敗"
 
-        cloud_menus = {}
+        menus = {}
         for row in rows[1:]:
             if len(row) <= max(idx_store, idx_item): continue
-            
-            store = row[idx_store].strip()
-            item = row[idx_item].strip()
-            
+            store, item = row[idx_store].strip(), row[idx_item].strip()
             if not store or not item: continue
             
-            item_prices = {}
-            
-            def get_clean_price(idx):
-                if idx != -1 and idx < len(row):
-                    val = str(row[idx]).replace("$", "").replace(",", "").strip()
-                    if val.isdigit():
-                        return int(val)
-                return None
+            prices = {}
+            def clean_p(val):
+                v = str(val).replace("$", "").replace(",", "").strip()
+                return int(v) if v.isdigit() else None
 
-            p_m = get_clean_price(idx_m)
-            p_l = get_clean_price(idx_l)
-            p_s = get_clean_price(idx_price)
+            pm, pl, pp = None, None, None
+            if idx_m != -1 and idx_m < len(row): pm = clean_p(row[idx_m])
+            if idx_l != -1 and idx_l < len(row): pl = clean_p(row[idx_l])
+            if idx_p != -1 and idx_p < len(row): pp = clean_p(row[idx_p])
             
-            if p_m: item_prices["中杯"] = p_m
-            if p_l: item_prices["大杯"] = p_l
+            if pm: prices["中杯"] = pm
+            if pl: prices["大杯"] = pl
+            if not prices: prices["單一規格"] = pp if pp else 0
             
-            if not item_prices:
-                if p_s: 
-                    item_prices["單一規格"] = p_s
-                else:
-                    item_prices = {"單一規格": 0}
+            if store not in menus: menus[store] = {}
+            menus[store][item] = prices
             
-            if store not in cloud_menus:
-                cloud_menus[store] = {}
-            cloud_menus[store][item] = item_prices
-            
-        return cloud_menus, None
-
+        return menus, None
     except Exception as e:
         return None, str(e)
 
-# 讀取加料設定
+# 讀取加料 (快取 60s)
 @st.cache_data(ttl=60)
-def load_toppings_from_sheet(_client, sheet_url):
+def load_toppings(_client, sheet_url):
     try:
-        spreadsheet = _client.open_by_url(sheet_url)
-        try:
-            worksheet = spreadsheet.worksheet("加料設定")
-        except gspread.WorksheetNotFound:
-            return {} 
-            
-        rows = worksheet.get_all_values()
+        sh = _client.open_by_url(sheet_url)
+        ws = sh.worksheet("加料設定")
+        rows = ws.get_all_values()
         if len(rows) < 2: return {}
         
         headers = [h.strip() for h in rows[0]]
+        idx_store = headers.index("店家") if "店家" in headers else -1
+        idx_name = headers.index("加料品項") if "加料品項" in headers else headers.index("品項")
+        idx_price = headers.index("價格") if "價格" in headers else -1
         
-        try:
-            idx_store = headers.index("店家")
-            idx_name = headers.index("加料品項") if "加料品項" in headers else headers.index("品項")
-            idx_price = headers.index("價格")
-        except:
-            return {}
-
+        if idx_store == -1 or idx_name == -1 or idx_price == -1: return {}
+        
         toppings = {}
         for row in rows[1:]:
             if len(row) <= max(idx_store, idx_name, idx_price): continue
-            store = str(row[idx_store]).strip()
-            name = str(row[idx_name]).strip()
-            price_str = str(row[idx_price]).replace("$", "").replace(",", "").strip()
-            
-            if store and name and price_str.isdigit():
-                if store not in toppings:
-                    toppings[store] = {}
-                toppings[store][name] = int(price_str)
+            store, name = row[idx_store].strip(), row[idx_name].strip()
+            price = str(row[idx_price]).replace("$", "").strip()
+            if store and name and price.isdigit():
+                if store not in toppings: toppings[store] = {}
+                toppings[store][name] = int(price)
         return toppings
-    except Exception:
+    except:
         return {}
 
-# 讀取會員存款
+# 讀取存款 (快取 60s)
 @st.cache_data(ttl=60)
-def load_balances_from_sheet(_client, sheet_url):
+def load_balances(_client, sheet_url):
     try:
-        spreadsheet = _client.open_by_url(sheet_url)
-        try:
-            worksheet = spreadsheet.worksheet("會員儲值")
-        except gspread.WorksheetNotFound:
-            return None 
-            
-        rows = worksheet.get_all_values()
+        sh = _client.open_by_url(sheet_url)
+        ws = sh.worksheet("會員儲值")
+        rows = ws.get_all_values()
         if len(rows) < 2: return {}
         
         headers = [h.strip() for h in rows[0]]
+        idx_name = -1
+        for k in ["姓名", "Name", "員工"]:
+            if k in headers: 
+                idx_name = headers.index(k)
+                break
         
-        def get_col_index(possible_names):
-            for name in possible_names:
-                if name in headers:
-                    return headers.index(name)
-            return -1
-            
-        idx_name = get_col_index(["姓名", "Name", "員工", "員工姓名"])
-        idx_balance = get_col_index(["存款餘額", "餘額", "存款", "Balance", "金額", "目前餘額"])
+        idx_bal = -1
+        for k in ["存款餘額", "餘額", "存款"]:
+            if k in headers:
+                idx_bal = headers.index(k)
+                break
+                
+        if idx_name == -1 or idx_bal == -1: return {}
         
-        if idx_name == -1 or idx_balance == -1:
-            return {}
-
         balances = {}
         for row in rows[1:]:
-            if len(row) <= max(idx_name, idx_balance): continue
-            
+            if len(row) <= max(idx_name, idx_bal): continue
             name = str(row[idx_name]).strip()
-            balance_str = str(row[idx_balance]).replace("$", "").replace(",", "").strip()
-            
+            bal = str(row[idx_bal]).replace("$", "").replace(",", "").strip()
             if name:
-                try:
-                    balances[name] = int(float(balance_str))
-                except:
-                    balances[name] = 0
+                try: balances[name] = int(float(bal))
+                except: balances[name] = 0
         return balances
-    except Exception:
+    except:
         return {}
 
-# 讀取訂單 (快取 5 秒)
+# 讀取訂單 (快取 5s - 高頻率)
 @st.cache_data(ttl=5)
-def get_orders_from_sheet(_client, sheet_url):
+def get_orders(_client, sheet_url):
     try:
-        spreadsheet = _client.open_by_url(sheet_url)
-        sheet = spreadsheet.get_worksheet(0)
-        return sheet.get_all_values()
-    except Exception:
+        sh = _client.open_by_url(sheet_url)
+        ws = sh.get_worksheet(0)
+        return ws.get_all_values()
+    except:
         return []
 
-# 新增交易紀錄 (Log)
+# ==========================================
+# 3. 功能操作層 (Actions Layer)
+# ==========================================
+
+# 寫入交易紀錄
 def log_transaction(_client, sheet_url, name, amount_change, new_balance, note=""):
     try:
-        spreadsheet = _client.open_by_url(sheet_url)
+        sh = _client.open_by_url(sheet_url)
         try:
-            wks_log = spreadsheet.worksheet("交易紀錄")
-        except gspread.WorksheetNotFound:
-            wks_log = spreadsheet.add_worksheet(title="交易紀錄", rows=1000, cols=5)
-            wks_log.append_row(["時間", "姓名", "變動金額", "變動後餘額", "備註"])
-            
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        wks_log.append_row([timestamp, name, amount_change, new_balance, note])
+            ws_log = sh.worksheet("交易紀錄")
+        except:
+            ws_log = sh.add_worksheet(title="交易紀錄", rows=1000, cols=5)
+            ws_log.append_row(["時間", "姓名", "變動金額", "變動後餘額", "備註"])
+        
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws_log.append_row([ts, name, amount_change, new_balance, note])
         return True
     except Exception as e:
         print(f"Log Error: {e}")
         return False
 
-# ==========================================
-# 3. PDF 生成與上傳 Drive
-# ==========================================
-def generate_pdf_report(df, total_amount):
+# 產生 PDF
+def generate_pdf(df, total_amount):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     elements = []
     
-    font_name = setup_chinese_font()
-    if not font_name:
-        font_name = 'Helvetica'
-
+    font_name = setup_chinese_font() or 'Helvetica'
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle('Title', parent=styles['Title'], fontName=font_name, fontSize=20, leading=24)
     normal_style = ParagraphStyle('Normal', parent=styles['Normal'], fontName=font_name, fontSize=12, leading=16)
     
-    today = datetime.now().strftime("%Y-%m-%d")
-    elements.append(Paragraph(f"飲料訂購結算單 ({today})", title_style))
+    elements.append(Paragraph(f"飲料訂購結算單 ({datetime.now().strftime('%Y-%m-%d')})", title_style))
     elements.append(Spacer(1, 12))
     elements.append(Paragraph(f"今日總營業額：{total_amount} 元", normal_style))
     elements.append(Spacer(1, 12))
     
-    display_cols = ['時間', '姓名', '品項', '大小', '加料', '甜度', '冰塊', '價格', '備註']
-    cols = [c for c in display_cols if c in df.columns]
+    cols_to_show = ['時間', '姓名', '品項', '大小', '加料', '甜度', '冰塊', '價格', '備註']
+    final_cols = [c for c in cols_to_show if c in df.columns]
     
-    data = [cols] + df[cols].values.tolist()
+    # 準備表格資料
+    data = [final_cols] + df[final_cols].astype(str).values.tolist()
     
     t = Table(data)
     t.setStyle(TableStyle([
@@ -320,7 +288,7 @@ def generate_pdf_report(df, total_amount):
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('INNERGRID', (0, 0), (-1, -1), 0.25, colors.black),
         ('BOX', (0, 0), (-1, -1), 0.25, colors.black),
-        ('FONTSIZE', (0, 0), (-1, -1), 10), 
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
     ]))
     
     elements.append(t)
@@ -328,24 +296,17 @@ def generate_pdf_report(df, total_amount):
     buffer.seek(0)
     return buffer
 
-def upload_pdf_to_drive(pdf_bytes, filename, s_info):
-    """將 PDF 上傳到指定的 Google Drive 資料夾"""
+# 上傳 Google Drive
+def upload_to_drive(pdf_bytes, filename, s_info):
     try:
-        # 1. 檢查是否有設定資料夾 ID
-        folder_id = None
-        if "drive_folder_id" in st.secrets:
-            folder_id = st.secrets["drive_folder_id"]
-        elif "drive" in st.secrets and "folder_id" in st.secrets["drive"]:
-            folder_id = st.secrets["drive"]["folder_id"]
-            
+        # 1. 檢查 Folder ID
+        folder_id = st.secrets.get("drive_folder_id") or st.secrets.get("drive", {}).get("folder_id")
         if not folder_id:
-            st.error("❌ 上傳失敗：未設定 `drive_folder_id`。請在 Secrets 中設定目標資料夾 ID。")
+            st.error("❌ 上傳失敗：未設定 `drive_folder_id`。")
             return None
 
-        # 2. 重建憑證 (為了 Drive API)
-        private_key = s_info["private_key"]
-        if "\\n" in private_key: private_key = private_key.replace("\\n", "\n")
-        
+        # 2. 重建憑證
+        private_key = s_info["private_key"].replace("\\n", "\n")
         creds_dict = {
             "type": s_info["type"],
             "project_id": s_info["project_id"],
@@ -358,468 +319,367 @@ def upload_pdf_to_drive(pdf_bytes, filename, s_info):
             "auth_provider_x509_cert_url": s_info.get("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs"),
             "client_x509_cert_url": s_info["client_x509_cert_url"]
         }
-        scopes = ['https://www.googleapis.com/auth/drive']
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        
-        # 3. 建立 Drive Service
+        creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/drive'])
         service = build('drive', 'v3', credentials=creds)
         
-        file_metadata = {
-            'name': filename,
-            'parents': [folder_id] 
-        }
-        
+        # 3. 上傳
+        file_metadata = {'name': filename, 'parents': [folder_id]}
         media = MediaIoBaseUpload(pdf_bytes, mimetype='application/pdf', resumable=True)
-        
-        # 4. 執行上傳 (supportsAllDrives=True 支援共用雲端硬碟)
         file = service.files().create(
             body=file_metadata, 
             media_body=media, 
             fields='id, webViewLink',
             supportsAllDrives=True
         ).execute()
-        
         return file.get('webViewLink')
         
     except Exception as e:
         error_str = str(e)
         if "storageQuotaExceeded" in error_str:
-            st.error("❌ 上傳失敗：機器人沒有儲存空間。請確認 `drive_folder_id` 正確，且資料夾已「共用」給機器人(編輯者權限)。")
+            st.error("❌ 上傳失敗：機器人無儲存空間，請確認資料夾ID正確並已共用(編輯者)。")
         elif "File not found" in error_str:
-            st.error(f"❌ 上傳失敗：找不到資料夾 ID `{folder_id}`。請確認 ID 正確且機器人有權限。")
+            st.error("❌ 上傳失敗：找不到資料夾ID，請檢查 Secrets。")
         else:
             st.error(f"上傳 Google Drive 失敗: {e}")
         return None
 
-DEFAULT_MENUS = {"範例店家": {"紅茶": {"單一規格": 30}}}
-SUGAR_OPTS = ["正常糖", "少糖 (8分)", "半糖 (5分)", "微糖 (3分)", "一分糖", "無糖"]
-ICE_OPTS = ["正常冰", "少冰", "微冰", "去冰", "常溫", "熱"]
-
 # ==========================================
-# 4. 主程式介面
+# 4. 主程式邏輯 (Main UI)
 # ==========================================
-st.title("🥤 辦公室飲料點餐系統")
 
-client = None
-s_info = None
+# 4-1. 初始化與載入資料
+client, s_info = get_google_client()
+sheet_url = s_info.get("spreadsheet")
+
 current_menus = DEFAULT_MENUS
 all_toppings = {}
 
-# --- 連線與資料載入 ---
-try:
-    client, s_info = get_google_sheet_data()
-    sheet_url = s_info.get("spreadsheet")
-    if sheet_url:
-        cloud_menus, error_msg = load_menu_from_sheet(client, sheet_url)
-        all_toppings = load_toppings_from_sheet(client, sheet_url)
-        
-        if cloud_menus:
-            current_menus = cloud_menus
-        else:
-            st.sidebar.warning(f"⚠️ 使用預設菜單 ({error_msg})")
-except Exception as e:
-    st.sidebar.error(f"連線異常: {e}")
-
-st.sidebar.header("點餐設定")
-
-if not current_menus:
-    st.error("❌ 無法載入菜單")
+if sheet_url:
+    menus, err = load_menu(client, sheet_url)
+    if menus: current_menus = menus
+    else: st.sidebar.warning(f"⚠️ 菜單讀取：{err}")
+    
+    all_toppings = load_toppings(client, sheet_url)
+else:
+    st.error("❌ 請在 Secrets 設定 Spreadsheet 網址")
     st.stop()
 
-selected_store = st.sidebar.selectbox("今天喝哪一家？", list(current_menus.keys()))
-current_menu_items = current_menus[selected_store]
-st.subheader(f"目前店家：{selected_store}")
+# 4-2. 側邊欄設定
+st.sidebar.title("🥤 點餐設定")
+selected_store = st.sidebar.selectbox("請選擇店家", list(current_menus.keys()))
+menu_items = current_menus[selected_store]
+store_toppings = all_toppings.get(selected_store, {})
 
-# 點餐區塊
-st.write("---")
+st.sidebar.divider()
+st.sidebar.header("功能選單")
+admin_mode = st.sidebar.checkbox("開啟管理員/結算專區")
+
+# 4-3. 使用者點餐區
+st.header(f"📍 目前店家：{selected_store}")
+
 col1, col2 = st.columns(2)
 with col1:
-    name = st.text_input("你的名字 (必填)")
+    user_name = st.text_input("你的名字 (必填)", key="u_name")
 with col2:
-    drink = st.selectbox("飲料品項", list(current_menu_items.keys()))
-    price_dict = current_menu_items[drink]
+    item_name = st.selectbox("飲料品項", list(menu_items.keys()), key="u_item")
+    price_table = menu_items[item_name]
 
 col3, col4, col5 = st.columns(3)
 with col3:
-    size = st.selectbox("大小", list(price_dict.keys()))
-    base_price = price_dict[size]
+    size = st.selectbox("大小", list(price_table.keys()), key="u_size")
+    base_price = price_table[size]
 with col4:
-    sugar = st.selectbox("甜度", SUGAR_OPTS)
+    sugar = st.selectbox("甜度", SUGAR_OPTS, key="u_sugar")
 with col5:
-    ice = st.selectbox("冰塊", ICE_OPTS)
+    ice = st.selectbox("冰塊", ICE_OPTS, key="u_ice")
 
-# --- 加料區塊 ---
-topping_price = 0
+# 加料區
+topping_cost = 0
 selected_toppings = []
-store_toppings_options = all_toppings.get(selected_store, {})
-
-if store_toppings_options:
+if store_toppings:
     st.write("---")
-    st.markdown("#### 🍬 加料區")
-    topping_labels = [f"{name} (+{price})" for name, price in store_toppings_options.items()]
-    selected_labels = st.multiselect("選擇配料", topping_labels)
+    st.subheader("🍬 加料區")
+    top_opts = [f"{k} (+{v})" for k, v in store_toppings.items()]
+    picked_tops = st.multiselect("選擇配料", top_opts, key="u_top")
     
-    for label in selected_labels:
-        t_name = label.split(" (+")[0]
-        t_price = store_toppings_options[t_name]
-        topping_price += t_price
-        selected_toppings.append(t_name)
-else:
-    st.caption("(此店家目前無設定加料選項)")
+    for pt in picked_tops:
+        tn = pt.split(" (+")[0]
+        tp = store_toppings[tn]
+        topping_cost += tp
+        selected_toppings.append(tn)
 
-final_price = base_price + topping_price
+final_price = base_price + topping_cost
 st.write("---")
-st.info(f"💰 **總金額：{final_price} 元** (飲料 {base_price} + 加料 {topping_price})")
+st.info(f"💰 **總金額：{final_price} 元** (飲料 {base_price} + 加料 {topping_cost})")
+user_note = st.text_input("備註", key="u_note")
 
-note = st.text_input("備註")
-
-if st.button("送出訂單", type="primary"):
-    if not name:
-        st.error("❌ 請記得輸入名字！")
+if st.button("送出訂單", type="primary", use_container_width=True):
+    if not user_name:
+        st.error("❌ 請輸入名字！")
     else:
         try:
-            order_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            topping_str = ", ".join(selected_toppings) if selected_toppings else ""
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            t_str = ", ".join(selected_toppings)
             
-            row_data = [
-                order_time, selected_store, name, drink, size, 
-                topping_str, final_price, sugar, ice, note
-            ]
+            # 欄位順序：時間, 店家, 姓名, 品項, 大小, 加料, 價格, 甜度, 冰塊, 備註
+            row = [ts, selected_store, user_name, item_name, size, t_str, final_price, sugar, ice, user_note]
             
-            sheet_url = s_info.get("spreadsheet")
-            spreadsheet = client.open_by_url(sheet_url)
-            sheet = spreadsheet.get_worksheet(0) 
-            sheet.append_row(row_data)
+            sh = client.open_by_url(sheet_url)
+            ws = sh.get_worksheet(0)
+            ws.append_row(row)
             
-            get_orders_from_sheet.clear()
-            
-            st.success(f"✅ {name} 點餐成功！")
+            get_orders.clear() # 清快取
+            st.success(f"✅ {user_name} 點餐成功！")
             st.balloons()
         except Exception as e:
-            st.error(f"⚠️ 寫入失敗：{e}")
+            st.error(f"寫入失敗: {e}")
 
 # ==========================================
-# 5. 管理員結算專區 (包含訂單編輯與餘額計算)
+# 5. 管理員專區 (Admin UI)
 # ==========================================
-st.sidebar.divider()
-st.sidebar.header("👮‍♂️ 管理員專區")
-
-if st.sidebar.checkbox("開啟結算功能"):
+if admin_mode:
     st.divider()
-    st.header("💰 結算管理")
+    st.header("👮‍♂️ 管理員專區")
     
-    try:
-        if s_info:
-            sheet_url = s_info.get("spreadsheet")
-            all_values = get_orders_from_sheet(client, sheet_url)
+    # 讀取訂單
+    raw_data = get_orders(client, sheet_url)
+    
+    if len(raw_data) > 1:
+        headers = raw_data[0]
+        # 過濾空白標題
+        valid_idx = [i for i, h in enumerate(headers) if h.strip()]
+        if not valid_idx:
+            st.error("無法讀取訂單標題，請檢查 Google Sheet")
+        else:
+            clean_headers = [headers[i] for i in valid_idx]
+            clean_rows = [[r[i] if i < len(r) else "" for i in valid_idx] for r in raw_data[1:]]
             
-            if len(all_values) > 1:
-                headers = all_values[0]
-                rows = all_values[1:]
-                
-                valid_indices = [i for i, h in enumerate(headers) if h.strip()]
-                
-                if not valid_indices:
-                    st.warning("⚠️ 讀取失敗：找不到任何有效的欄位標題。")
-                else:
-                    clean_headers = [headers[i] for i in valid_indices]
-                    clean_rows = []
-                    for row in rows:
-                        clean_row = [row[i] if i < len(row) else "" for i in valid_indices]
-                        clean_rows.append(clean_row)
-                    
-                    df = pd.DataFrame(clean_rows, columns=clean_headers)
-                    
-                    if '價格' in df.columns:
-                        df['價格'] = pd.to_numeric(df['價格'], errors='coerce').fillna(0)
-                    elif 'Price' in df.columns:
-                        df['Price'] = pd.to_numeric(df['Price'], errors='coerce').fillna(0)
-                    
-                    total_amount = df['價格'].sum() if '價格' in df.columns else 0
-                    
-                    st.metric("💵 今日總營業額", f"{int(total_amount)} 元")
-                    
-                    # --- 編輯區塊 ---
-                    st.markdown("### ✏️ 訂單管理與編輯")
-                    st.caption("您可以直接點擊表格修改內容，或選取左側方框刪除列。修改完請務必按下方「儲存變更」。")
-                    
-                    all_stores = list(current_menus.keys())
-                    all_items = set()
-                    for m in current_menus.values():
-                        all_items.update(m.keys())
-                    all_items = sorted(list(all_items))
-                    all_sizes = ["中杯", "大杯", "單一規格", "L", "M"]
+            df = pd.DataFrame(clean_rows, columns=clean_headers)
+            
+            # 確保價格為數字
+            for col in ['價格', 'Price']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            
+            total = df['價格'].sum() if '價格' in df.columns else 0
+            st.metric("💵 今日總營業額", f"{int(total)} 元")
 
-                    edited_df = st.data_editor(
-                        df, 
-                        num_rows="dynamic",
+            # --- A. 訂單編輯區 ---
+            st.subheader("✏️ 訂單管理")
+            st.caption("勾選「刪除」可移除訂單；修改內容後請按「儲存變更」，系統將自動重新計算價格。")
+            
+            # 準備下拉選單資料
+            all_stores = list(current_menus.keys())
+            all_items = set()
+            for m in current_menus.values(): all_items.update(m.keys())
+            all_items = sorted(list(all_items))
+            all_sizes = ["中杯", "大杯", "單一規格", "L", "M"]
+
+            # 插入刪除欄位
+            df_edit = df.copy()
+            df_edit.insert(0, "刪除", False)
+
+            edited_df = st.data_editor(
+                df_edit,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="order_editor",
+                column_config={
+                    "刪除": st.column_config.CheckboxColumn("刪除", width="small"),
+                    "店家": st.column_config.SelectboxColumn("店家", options=all_stores, required=True),
+                    "品項": st.column_config.SelectboxColumn("品項", options=all_items, required=True),
+                    "大小": st.column_config.SelectboxColumn("大小", options=all_sizes, required=True),
+                    "甜度": st.column_config.SelectboxColumn("甜度", options=SUGAR_OPTS, required=True),
+                    "冰塊": st.column_config.SelectboxColumn("冰塊", options=ICE_OPTS, required=True),
+                    "價格": st.column_config.NumberColumn("價格", min_value=0, step=1)
+                }
+            )
+
+            if st.button("💾 儲存訂單變更 (Save Changes)"):
+                try:
+                    # 過濾刪除
+                    rows_to_save = edited_df[edited_df["刪除"] == False].drop(columns=["刪除"])
+                    
+                    # 自動重算價格
+                    for idx, row in rows_to_save.iterrows():
+                        try:
+                            r_store, r_item, r_size = row.get('店家'), row.get('品項'), row.get('大小')
+                            r_tops = str(row.get('加料', ""))
+                            
+                            # 基底價格
+                            base = 0
+                            if r_store in current_menus and r_item in current_menus[r_store]:
+                                sizes = current_menus[r_store][r_item]
+                                base = sizes.get(r_size, sizes.get("單一規格", 0))
+                            
+                            # 加料價格
+                            top_c = 0
+                            if r_tops and r_store in all_toppings:
+                                for t in r_tops.split(","):
+                                    t = t.strip()
+                                    if t in all_toppings[r_store]: top_c += all_toppings[r_store][t]
+                            
+                            new_p = base + top_c
+                            if new_p > 0: rows_to_save.at[idx, '價格'] = new_p
+                        except: pass
+                    
+                    # 寫回 Sheet
+                    new_headers = rows_to_save.columns.tolist()
+                    new_vals = rows_to_save.astype(str).values.tolist()
+                    
+                    sh = client.open_by_url(sheet_url)
+                    ws = sh.get_worksheet(0)
+                    ws.clear()
+                    ws.update(values=[new_headers] + new_vals)
+                    
+                    get_orders.clear()
+                    st.success("✅ 訂單更新成功！")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"儲存失敗: {e}")
+
+            # --- B. 餘額扣款與結算 ---
+            st.divider()
+            st.subheader("💰 餘額扣款與結算")
+            
+            balances = load_balances(client, sheet_url)
+            
+            if balances is None:
+                st.warning("請先建立「會員儲值」分頁以使用扣款功能")
+            elif '姓名' in df.columns and '價格' in df.columns:
+                # 計算每人消費
+                spending = df.groupby('姓名')['價格'].sum().reset_index()
+                spending.columns = ['姓名', '今日消費']
+                
+                # 準備結算預覽表
+                report_data = []
+                for _, row in spending.iterrows():
+                    name = row['姓名']
+                    cost = int(row['今日消費'])
+                    curr = balances.get(name, 0)
+                    remain = curr - cost
+                    status = "✅ 足夠" if remain >= 0 else "❌ 不足"
+                    report_data.append({
+                        "姓名": name, "目前存款": curr, "今日消費": cost, 
+                        "扣款後餘額": remain, "狀態": status
+                    })
+                
+                if report_data:
+                    bal_df = pd.DataFrame(report_data)
+                    st.caption("👇 請確認「扣款後餘額」，按下確認鍵將執行：更新餘額、寫Log、產PDF、上傳雲端、清空訂單。")
+                    
+                    edited_bal_df = st.data_editor(
+                        bal_df,
                         use_container_width=True,
-                        key="order_editor",
+                        disabled=["姓名", "目前存款", "今日消費", "狀態"],
                         column_config={
-                            "店家": st.column_config.SelectboxColumn("店家", options=all_stores, required=True),
-                            "品項": st.column_config.SelectboxColumn("品項", options=all_items, required=True),
-                            "大小": st.column_config.SelectboxColumn("大小", options=all_sizes, required=True),
-                            "甜度": st.column_config.SelectboxColumn("甜度", options=SUGAR_OPTS, required=True),
-                            "冰塊": st.column_config.SelectboxColumn("冰塊", options=ICE_OPTS, required=True),
-                            "價格": st.column_config.NumberColumn("價格", min_value=0, step=1)
+                            "扣款後餘額": st.column_config.NumberColumn("扣款後餘額 (可編輯)", required=True, step=1)
                         }
                     )
                     
-                    if st.button("💾 儲存變更 (Save Changes)", type="primary"):
+                    if st.button("💸 確認扣款並更新儲值表 (End of Day)", type="primary"):
+                        status_box = st.empty()
+                        status_box.info("⏳ 正在處理結算流程...")
+                        
                         try:
-                            # --- 自動重新計算價格邏輯 ---
-                            for idx, row in edited_df.iterrows():
-                                try:
-                                    r_store = row.get('店家')
-                                    r_item = row.get('品項')
-                                    r_size = row.get('大小')
-                                    r_toppings = row.get('加料', "")
-                                    
-                                    # 1. 找飲料基底價格
-                                    base = 0
-                                    if r_store in current_menus and r_item in current_menus[r_store]:
-                                        sizes = current_menus[r_store][r_item]
-                                        if r_size in sizes:
-                                            base = sizes[r_size]
-                                        elif "單一規格" in sizes:
-                                            base = sizes["單一規格"]
-                                    
-                                    # 2. 找加料價格
-                                    top_cost = 0
-                                    if r_toppings and r_store in all_toppings:
-                                        ts = [t.strip() for t in str(r_toppings).split(",")]
-                                        for t in ts:
-                                            if t in all_toppings[r_store]:
-                                                top_cost += all_toppings[r_store][t]
-                                    
-                                    # 3. 更新價格 (只有當計算出有效價格時才更新，保留手動修正的可能性)
-                                    new_p = base + top_cost
-                                    if new_p > 0: 
-                                        edited_df.at[idx, '價格'] = new_p
-                                        
-                                except Exception:
-                                    pass # 若計算失敗則維持原價
+                            sh = client.open_by_url(sheet_url)
+                            ws_bal = sh.worksheet("會員儲值")
                             
-                            recalc_total = edited_df['價格'].sum()
-                            st.toast(f"已自動重新計算價格，總金額：{recalc_total} 元")
-
-                            updated_headers = edited_df.columns.tolist()
-                            updated_values = edited_df.astype(str).values.tolist()
-                            all_data = [updated_headers] + updated_values
+                            # 1. 準備更新資料
+                            update_map = {r['姓名']: r['扣款後餘額'] for _, r in edited_bal_df.iterrows()}
+                            logs = []
+                            for _, r in edited_bal_df.iterrows():
+                                diff = r['扣款後餘額'] - r['目前存款']
+                                if diff != 0:
+                                    logs.append({"name": r['姓名'], "change": diff, "bal": r['扣款後餘額'], "note": f"消費 {r['今日消費']}"})
                             
-                            spreadsheet = client.open_by_url(sheet_url)
-                            sheet = spreadsheet.get_worksheet(0)
+                            # 2. 更新儲值表 (保留原順序，新增新人)
+                            bal_rows = ws_bal.get_all_values()
+                            if not bal_rows: bal_rows = [["姓名", "存款餘額"]]
                             
-                            sheet.clear()
-                            sheet.update(values=all_data)
+                            h_bal = bal_rows[0]
+                            try:
+                                i_n = -1
+                                for k in ["姓名", "Name"]: 
+                                    if k in h_bal: i_n = h_bal.index(k)
+                                i_b = -1
+                                for k in ["存款餘額", "餘額"]: 
+                                    if k in h_bal: i_b = h_bal.index(k)
+                            except: i_n, i_b = -1, -1
                             
-                            get_orders_from_sheet.clear()
-                            
-                            st.success("✅ 訂單已更新成功！")
-                            st.rerun()
+                            if i_n != -1 and i_b != -1:
+                                updated_names = set()
+                                for i in range(1, len(bal_rows)):
+                                    r = bal_rows[i]
+                                    if len(r) > i_n:
+                                        nm = r[i_n].strip()
+                                        if nm in update_map:
+                                            while len(r) <= i_b: r.append("")
+                                            r[i_b] = str(update_map[nm])
+                                            updated_names.add(nm)
+                                
+                                for nm, val in update_map.items():
+                                    if nm not in updated_names:
+                                        nr = [""] * (max(i_n, i_b) + 1)
+                                        nr[i_n], nr[i_b] = nm, str(val)
+                                        bal_rows.append(nr)
+                                
+                                ws_bal.clear()
+                                ws_bal.update(values=bal_rows)
+                                
+                                # 3. 寫Log
+                                for l in logs:
+                                    log_transaction(client, sheet_url, l["name"], l["change"], l["bal"], l["note"])
+                                
+                                # 4. PDF & Drive
+                                status_box.info("⏳ 上傳報表中...")
+                                pdf = generate_pdf_report(df, int(total_amount))
+                                fname = f"飲料結算_{datetime.now().strftime('%Y%m%d')}.pdf"
+                                link = upload_to_drive(pdf, fname, s_info)
+                                
+                                # 5. 清空訂單
+                                status_box.info("⏳ 清空訂單中...")
+                                ws_ord = sh.get_worksheet(0)
+                                ws_ord.clear()
+                                ws_ord.append_row(['時間', '店家', '姓名', '品項', '大小', '加料', '價格', '甜度', '冰塊', '備註'])
+                                
+                                load_balances.clear()
+                                get_orders.clear()
+                                
+                                msg = f"✅ 結算完成！[PDF 下載]({link})" if link else "✅ 結算完成！(PDF 上傳失敗)"
+                                status_box.markdown(msg)
+                                if st.button("🔄 重新載入"): st.rerun()
+                            else:
+                                st.error("儲值表欄位辨識失敗")
                         except Exception as e:
-                            st.error(f"儲存失敗：{e}")
-                    
-                    st.write("---")
-                    
-                    # --- 餘額扣款試算 ---
-                    st.markdown("### 💰 餘額扣款試算")
-                    
-                    balances = load_balances_from_sheet(client, sheet_url)
-                    
-                    if balances is None:
-                        st.info("💡 尚未設定「會員儲值」分頁。")
-                    elif '姓名' in df.columns and '價格' in df.columns:
-                        spending = df.groupby('姓名')['價格'].sum().reset_index()
-                        spending.columns = ['姓名', '今日消費']
-                        
-                        report_data = []
-                        for _, row in spending.iterrows():
-                            name = row['姓名']
-                            spend_amt = int(row['今日消費'])
-                            current_balance = balances.get(name, 0)
-                            remain = current_balance - spend_amt
-                            
-                            status = "✅ 足夠"
-                            if remain < 0:
-                                status = "❌ 餘額不足"
-                            
-                            report_data.append({
-                                "姓名": name,
-                                "目前存款": current_balance,
-                                "今日消費": spend_amt,
-                                "扣款後餘額": remain,
-                                "狀態": status
-                            })
-                        
-                        if report_data:
-                            balance_df = pd.DataFrame(report_data)
-                            
-                            st.caption("👇 您可以直接修改「扣款後餘額」，確認無誤後請按下方按鈕更新回 Google Sheet。")
-                            
-                            edited_balance_df = st.data_editor(
-                                balance_df, 
-                                use_container_width=True,
-                                key="balance_editor",
-                                disabled=["姓名", "目前存款", "今日消費", "狀態"],
-                                column_config={
-                                    "扣款後餘額": st.column_config.NumberColumn(
-                                        "扣款後餘額 (可編輯)",
-                                        help="修改此數值將會更新到儲值表",
-                                        required=True,
-                                        step=1
-                                    ),
-                                    "狀態": st.column_config.TextColumn("狀態", width="small")
-                                }
-                            )
-                            
-                            if st.button("💸 確認扣款並更新儲值表 (Update & Clear)", type="primary"):
-                                try:
-                                    status_container = st.empty()
-                                    status_container.info("⏳ 處理中：正在更新餘額與記錄交易...")
-                                    
-                                    # 1. 更新資料準備
-                                    update_map = {}
-                                    changes_log = [] 
-                                    for index, row in edited_balance_df.iterrows():
-                                        new_balance = row['扣款後餘額']
-                                        update_map[row['姓名']] = new_balance
-                                        
-                                        old_balance = row['目前存款']
-                                        diff = new_balance - old_balance
-                                        if diff != 0:
-                                            changes_log.append({
-                                                "name": row['姓名'],
-                                                "change": diff,
-                                                "balance": new_balance,
-                                                "note": f"訂單扣款 (消費 {row['今日消費']})"
-                                            })
-                                    
-                                    # 2. 讀取儲值表
-                                    spreadsheet = client.open_by_url(sheet_url)
-                                    try:
-                                        wks_balance = spreadsheet.worksheet("會員儲值")
-                                    except gspread.WorksheetNotFound:
-                                        st.error("找不到「會員儲值」分頁，無法更新。")
-                                        st.stop()
-                                    
-                                    # 3. 更新邏輯
-                                    all_rows = wks_balance.get_all_values()
-                                    if len(all_rows) < 1: all_rows = [["姓名", "存款餘額"]]
-                                    headers = all_rows[0]
-                                    
-                                    def find_col(keywords):
-                                        for k in keywords:
-                                            if k in headers: return headers.index(k)
-                                        return -1
-                                    
-                                    idx_name = find_col(["姓名", "Name", "員工", "員工姓名"])
-                                    idx_val = find_col(["存款餘額", "餘額", "存款", "Balance", "金額", "目前餘額"])
-                                    
-                                    if idx_name == -1 or idx_val == -1:
-                                        st.error("儲值表欄位辨識失敗。")
-                                    else:
-                                        updated_names = set()
-                                        for i in range(1, len(all_rows)):
-                                            row = all_rows[i]
-                                            if len(row) > idx_name:
-                                                r_name = row[idx_name].strip()
-                                                if r_name in update_map:
-                                                    while len(row) <= idx_val: row.append("")
-                                                    row[idx_val] = str(update_map[r_name])
-                                                    updated_names.add(r_name)
-                                        
-                                        for name, bal in update_map.items():
-                                            if name not in updated_names:
-                                                new_row = [""] * (max(idx_name, idx_val) + 1)
-                                                new_row[idx_name] = name
-                                                new_row[idx_val] = str(bal)
-                                                all_rows.append(new_row)
-                                        
-                                        wks_balance.clear()
-                                        wks_balance.update(values=all_rows)
-                                        
-                                        for log in changes_log:
-                                            log_transaction(client, sheet_url, log["name"], log["change"], log["balance"], log["note"])
-                                        
-                                        # 6. 生成 PDF 並上傳 Google Drive
-                                        status_container.info("⏳ 處理中：正在生成 PDF 並上傳 Google Drive...")
-                                        pdf_bytes = generate_pdf_report(df, int(total_amount))
-                                        filename = f"飲料結算_{datetime.now().strftime('%Y%m%d')}.pdf"
-                                        
-                                        drive_link = upload_pdf_to_drive(pdf_bytes, filename, s_info)
-                                        
-                                        drive_msg = ""
-                                        if drive_link:
-                                            drive_msg = f"📂 [PDF 已上傳至雲端]({drive_link})"
-                                        else:
-                                            drive_msg = "⚠️ PDF 上傳失敗 (請檢查 Secrets)"
-                                        
-                                        # 7. 清空訂單
-                                        status_container.info("⏳ 處理中：正在清空訂單...")
-                                        standard_headers = ['時間', '店家', '姓名', '品項', '大小', '加料', '價格', '甜度', '冰塊', '備註']
-                                        sheet_order = spreadsheet.get_worksheet(0)
-                                        sheet_order.clear()
-                                        sheet_order.append_row(standard_headers)
-                                        
-                                        load_balances_from_sheet.clear()
-                                        get_orders_from_sheet.clear()
-                                        
-                                        status_container.success(f"✅ 完成！餘額已更新、訂單已清空。")
-                                        if drive_link:
-                                            st.markdown(drive_msg)
-                                        
-                                        if st.button("🔄 重新整理頁面"):
-                                            st.rerun()
-                                        
-                                except Exception as e:
-                                    st.error(f"更新失敗：{e}")
+                            st.error(f"結算失敗: {e}")
+                else:
+                    st.info("今日無訂單需扣款")
 
-                        else:
-                            st.caption("今日尚未有訂單，無法計算扣款。")
-                            
-                    # --- 顯示所有人員儲值資料 ---
-                    st.write("---")
-                    st.markdown("### 📋 所有人員儲值明細")
-                    if balances:
-                        all_balance_data = [{"姓名": k, "存款餘額": v} for k, v in balances.items()]
-                        all_balance_df = pd.DataFrame(all_balance_data)
-                        all_balance_df = all_balance_df.sort_values(by="存款餘額")
-                        st.dataframe(all_balance_df, use_container_width=True, column_config={"存款餘額": st.column_config.NumberColumn("存款餘額", format="$%d")})
-                    else:
-                        st.info("尚無儲值資料。")
-                    
-                    st.write("---")
-            else:
-                st.info("📭 目前是空的，沒有訂單。")
-    except Exception as e:
-        st.error(f"讀取資料失敗：{e}")
+            # --- C. 檢視所有餘額 ---
+            with st.expander("📋 查看所有人員儲值餘額"):
+                if balances:
+                    b_data = [{"姓名": k, "存款餘額": v} for k, v in balances.items()]
+                    st.dataframe(pd.DataFrame(b_data).sort_values("存款餘額"), use_container_width=True)
+                else:
+                    st.write("無資料")
+
+    else:
+        st.info("📭 目前訂單列表是空的")
 
 # ==========================================
-# 6. 訂單列表 (常駐顯示)
+# 6. 訂單列表 (Footer)
 # ==========================================
 st.divider()
-st.write("📊 **目前訂單列表：**")
-try:
-    if s_info:
-        sheet_url = s_info.get("spreadsheet")
-        all_values = get_orders_from_sheet(client, sheet_url)
-        
-        if len(all_values) > 1:
-            headers = all_values[0]
-            rows = all_values[1:]
-            
-            valid_indices = [i for i, h in enumerate(headers) if h.strip()]
-            if valid_indices:
-                clean_headers = [headers[i] for i in valid_indices]
-                clean_rows = []
-                for row in rows:
-                    clean_row = [row[i] if i < len(row) else "" for i in valid_indices]
-                    clean_rows.append(clean_row)
-                
-                df = pd.DataFrame(clean_rows, columns=clean_headers)
-                st.dataframe(df)
-        else:
-            st.info("目前沒有資料")
-except:
-    pass
+st.subheader("📊 今日訂單列表")
+data_disp = get_orders(client, sheet_url)
+if len(data_disp) > 1:
+    h = data_disp[0]
+    r = data_disp[1:]
+    v_idx = [i for i, x in enumerate(h) if x.strip()]
+    if v_idx:
+        c_h = [h[i] for i in v_idx]
+        c_r = [[row[i] if i < len(row) else "" for i in v_idx] for row in r]
+        st.dataframe(pd.DataFrame(c_r, columns=c_h), use_container_width=True)
+else:
+    st.info("尚無訂單")
