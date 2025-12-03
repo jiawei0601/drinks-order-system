@@ -567,6 +567,42 @@ if st.sidebar.checkbox("開啟結算功能"):
                     
                     if st.button("💾 儲存變更 (Save Changes)", type="primary"):
                         try:
+                            # --- 自動重新計算價格邏輯 ---
+                            for idx, row in edited_df.iterrows():
+                                try:
+                                    r_store = row.get('店家')
+                                    r_item = row.get('品項')
+                                    r_size = row.get('大小')
+                                    r_toppings = row.get('加料', "")
+                                    
+                                    # 1. 找飲料基底價格
+                                    base = 0
+                                    if r_store in current_menus and r_item in current_menus[r_store]:
+                                        sizes = current_menus[r_store][r_item]
+                                        if r_size in sizes:
+                                            base = sizes[r_size]
+                                        elif "單一規格" in sizes:
+                                            base = sizes["單一規格"]
+                                    
+                                    # 2. 找加料價格
+                                    top_cost = 0
+                                    if r_toppings and r_store in all_toppings:
+                                        ts = [t.strip() for t in str(r_toppings).split(",")]
+                                        for t in ts:
+                                            if t in all_toppings[r_store]:
+                                                top_cost += all_toppings[r_store][t]
+                                    
+                                    # 3. 更新價格 (只有當計算出有效價格時才更新，保留手動修正的可能性)
+                                    new_p = base + top_cost
+                                    if new_p > 0: 
+                                        edited_df.at[idx, '價格'] = new_p
+                                        
+                                except Exception:
+                                    pass # 若計算失敗則維持原價
+                            
+                            recalc_total = edited_df['價格'].sum()
+                            st.toast(f"已自動重新計算價格，總金額：{recalc_total} 元")
+
                             updated_headers = edited_df.columns.tolist()
                             updated_values = edited_df.astype(str).values.tolist()
                             all_data = [updated_headers] + updated_values
@@ -576,6 +612,7 @@ if st.sidebar.checkbox("開啟結算功能"):
                             
                             sheet.clear()
                             sheet.update(values=all_data)
+                            
                             get_orders_from_sheet.clear()
                             
                             st.success("✅ 訂單已更新成功！")
