@@ -461,8 +461,8 @@ if admin_mode:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             
-            total = df['價格'].sum() if '價格' in df.columns else 0
-            st.metric("💵 今日總營業額", f"{int(total)} 元")
+            total_amount = df['價格'].sum() if '價格' in df.columns else 0
+            st.metric("💵 今日總營業額", f"{int(total_amount)} 元")
 
             # --- A. 訂單編輯區 ---
             st.subheader("✏️ 訂單管理")
