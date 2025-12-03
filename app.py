@@ -683,3 +683,26 @@ if len(data_disp) > 1:
         st.dataframe(pd.DataFrame(c_r, columns=c_h), use_container_width=True)
 else:
     st.info("尚無訂單")
+# 上傳 Google Drive
+def upload_to_drive(pdf_bytes, filename, s_info):
+    try:
+        # 1. 檢查 Folder ID (增強版：支援多種 Secrets 位置)
+        # 優先找全域設定
+        folder_id = st.secrets.get("drive_folder_id")
+        
+        # 其次找 [drive] 區塊
+        if not folder_id:
+            folder_id = st.secrets.get("drive", {}).get("folder_id")
+            
+        # 最後找看看是不是不小心貼在 [connections.gsheets] (即 s_info) 裡面了
+        if not folder_id and isinstance(s_info, dict):
+            folder_id = s_info.get("drive_folder_id")
+            
+        if not folder_id:
+            st.error("❌ 上傳失敗：未設定 `drive_folder_id`。請去 Streamlit Cloud 的 Secrets 補上資料夾 ID。")
+            return None
+
+        # 2. 重建憑證
+        private_key = s_info["private_key"].replace("\\n", "\n")
+        creds_dict = {
+            "type": s_info["type"],
