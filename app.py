@@ -99,7 +99,7 @@ def get_google_sheet_data():
         st.stop()
 
 # ==========================================
-# 2. 資料讀取 (菜單、加料 & 訂單) - 含快取機制
+# 2. 資料讀取 (菜單、加料、訂單 & 存款) - 含快取機制
 # ==========================================
 
 # 讀取菜單
@@ -207,6 +207,32 @@ def load_toppings_from_sheet(_client, sheet_url):
                     toppings[store] = {}
                 toppings[store][name] = int(price_str)
         return toppings
+    except Exception:
+        return {}
+
+# 讀取會員存款 (新增)
+@st.cache_data(ttl=60)
+def load_balances_from_sheet(_client, sheet_url):
+    try:
+        spreadsheet = _client.open_by_url(sheet_url)
+        try:
+            worksheet = spreadsheet.worksheet("會員儲值")
+        except gspread.WorksheetNotFound:
+            return None # 代表沒有設定存款分頁
+            
+        records = worksheet.get_all_records()
+        balances = {}
+        for row in records:
+            name = str(row.get("姓名", "")).strip()
+            # 清理金額格式 (去除 $ 和 ,)
+            balance_str = str(row.get("存款餘額", "0")).replace("$", "").replace(",", "").strip()
+            
+            if name:
+                try:
+                    balances[name] = int(float(balance_str))
+                except:
+                    balances[name] = 0
+        return balances
     except Exception:
         return {}
 
@@ -374,7 +400,7 @@ if st.button("送出訂單", type="primary"):
             st.error(f"⚠️ 寫入失敗：{e}")
 
 # ==========================================
-# 5. 管理員結算專區 (包含訂單編輯)
+# 5. 管理員結算專區 (包含訂單編輯與餘額計算)
 # ==========================================
 st.sidebar.divider()
 st.sidebar.header("👮‍♂️ 管理員專區")
@@ -386,6 +412,7 @@ if st.sidebar.checkbox("開啟結算功能"):
     try:
         if s_info:
             sheet_url = s_info.get("spreadsheet")
+            # 改用快取函式讀取資料
             all_values = get_orders_from_sheet(client, sheet_url)
             
             if len(all_values) > 1:
@@ -406,11 +433,13 @@ if st.sidebar.checkbox("開啟結算功能"):
                     
                     df = pd.DataFrame(clean_rows, columns=clean_headers)
                     
-                    total_amount = 0
+                    # 確保價格是數字
                     if '價格' in df.columns:
-                        total_amount = pd.to_numeric(df['價格'], errors='coerce').fillna(0).sum()
+                        df['價格'] = pd.to_numeric(df['價格'], errors='coerce').fillna(0)
                     elif 'Price' in df.columns:
-                        total_amount = pd.to_numeric(df['Price'], errors='coerce').fillna(0).sum()
+                        df['Price'] = pd.to_numeric(df['Price'], errors='coerce').fillna(0)
+                    
+                    total_amount = df['價格'].sum() if '價格' in df.columns else 0
                     
                     st.metric("💵 今日總營業額", f"{int(total_amount)} 元")
                     
@@ -493,6 +522,58 @@ if st.sidebar.checkbox("開啟結算功能"):
                             st.rerun()
                         except Exception as e:
                             st.error(f"儲存失敗：{e}")
+                    
+                    st.write("---")
+                    
+                    # --- 餘額扣款試算 (新增功能) ---
+                    st.markdown("### 💰 餘額扣款試算")
+                    
+                    # 1. 讀取存款
+                    balances = load_balances_from_sheet(client, sheet_url)
+                    
+                    if balances is None:
+                        st.info("💡 尚未設定「會員儲值」分頁。若需使用扣款功能，請在 Google Sheet 新增分頁並設定「姓名」、「存款餘額」欄位。")
+                    elif '姓名' in df.columns and '價格' in df.columns:
+                        # 2. 計算每人今日消費
+                        spending = df.groupby('姓名')['價格'].sum().reset_index()
+                        spending.columns = ['姓名', '今日消費']
+                        
+                        # 3. 合併存款資料
+                        # 建立報表資料 List
+                        report_data = []
+                        for _, row in spending.iterrows():
+                            name = row['姓名']
+                            spend_amt = int(row['今日消費'])
+                            current_balance = balances.get(name, 0)
+                            remain = current_balance - spend_amt
+                            
+                            status = "✅ 足夠"
+                            if remain < 0:
+                                status = "❌ 餘額不足"
+                            
+                            report_data.append({
+                                "姓名": name,
+                                "目前存款": current_balance,
+                                "今日消費": spend_amt,
+                                "扣款後餘額": remain,
+                                "狀態": status
+                            })
+                        
+                        if report_data:
+                            balance_df = pd.DataFrame(report_data)
+                            st.dataframe(
+                                balance_df, 
+                                use_container_width=True,
+                                column_config={
+                                    "狀態": st.column_config.TextColumn(
+                                        "狀態",
+                                        help="餘額是否足夠",
+                                        width="small"
+                                    )
+                                }
+                            )
+                        else:
+                            st.caption("今日尚未有訂單，無法計算扣款。")
                     
                     st.write("---")
                     
