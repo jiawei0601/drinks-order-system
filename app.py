@@ -214,7 +214,7 @@ def load_toppings_from_sheet(_client, sheet_url):
     except Exception:
         return {}
 
-# 讀取會員存款 (新增)
+# 讀取會員存款
 @st.cache_data(ttl=60)
 def load_balances_from_sheet(_client, sheet_url):
     try:
@@ -222,15 +222,13 @@ def load_balances_from_sheet(_client, sheet_url):
         try:
             worksheet = spreadsheet.worksheet("會員儲值")
         except gspread.WorksheetNotFound:
-            return None # 代表沒有設定存款分頁
+            return None 
             
-        # 改用 get_all_values 避免標題重複報錯
         rows = worksheet.get_all_values()
         if len(rows) < 2: return {}
         
         headers = [h.strip() for h in rows[0]]
         
-        # 尋找欄位 (支援多種寫法)
         def get_col_index(possible_names):
             for name in possible_names:
                 if name in headers:
@@ -248,7 +246,6 @@ def load_balances_from_sheet(_client, sheet_url):
             if len(row) <= max(idx_name, idx_balance): continue
             
             name = str(row[idx_name]).strip()
-            # 清理金額格式 (去除 $ 和 ,)
             balance_str = str(row[idx_balance]).replace("$", "").replace(",", "").strip()
             
             if name:
@@ -277,7 +274,6 @@ def log_transaction(_client, sheet_url, name, amount_change, new_balance, note="
         try:
             wks_log = spreadsheet.worksheet("交易紀錄")
         except gspread.WorksheetNotFound:
-            # 如果沒有交易紀錄分頁，則建立一個
             wks_log = spreadsheet.add_worksheet(title="交易紀錄", rows=1000, cols=5)
             wks_log.append_row(["時間", "姓名", "變動金額", "變動後餘額", "備註"])
             
@@ -335,7 +331,18 @@ def generate_pdf_report(df, total_amount):
 def upload_pdf_to_drive(pdf_bytes, filename, s_info):
     """將 PDF 上傳到指定的 Google Drive 資料夾"""
     try:
-        # 重建憑證 (為了 Drive API)
+        # 1. 檢查是否有設定資料夾 ID
+        folder_id = None
+        if "drive_folder_id" in st.secrets:
+            folder_id = st.secrets["drive_folder_id"]
+        elif "drive" in st.secrets and "folder_id" in st.secrets["drive"]:
+            folder_id = st.secrets["drive"]["folder_id"]
+            
+        if not folder_id:
+            st.error("❌ 上傳失敗：未設定 `drive_folder_id`。請在 Secrets 中設定目標資料夾 ID。")
+            return None
+
+        # 2. 重建憑證 (為了 Drive API)
         private_key = s_info["private_key"]
         if "\\n" in private_key: private_key = private_key.replace("\\n", "\n")
         
@@ -354,27 +361,34 @@ def upload_pdf_to_drive(pdf_bytes, filename, s_info):
         scopes = ['https://www.googleapis.com/auth/drive']
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         
-        # 建立 Drive Service
+        # 3. 建立 Drive Service
         service = build('drive', 'v3', credentials=creds)
         
-        # 取得目標資料夾 ID
-        folder_id = None
-        if "drive_folder_id" in st.secrets:
-            folder_id = st.secrets["drive_folder_id"]
-        elif "drive" in st.secrets and "folder_id" in st.secrets["drive"]:
-            folder_id = st.secrets["drive"]["folder_id"]
-            
-        file_metadata = {'name': filename}
-        if folder_id:
-            file_metadata['parents'] = [folder_id]
+        file_metadata = {
+            'name': filename,
+            'parents': [folder_id] 
+        }
         
         media = MediaIoBaseUpload(pdf_bytes, mimetype='application/pdf', resumable=True)
         
-        file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        # 4. 執行上傳 (supportsAllDrives=True 支援共用雲端硬碟)
+        file = service.files().create(
+            body=file_metadata, 
+            media_body=media, 
+            fields='id, webViewLink',
+            supportsAllDrives=True
+        ).execute()
+        
         return file.get('webViewLink')
         
     except Exception as e:
-        st.error(f"上傳 Google Drive 失敗: {e}")
+        error_str = str(e)
+        if "storageQuotaExceeded" in error_str:
+            st.error("❌ 上傳失敗：機器人沒有儲存空間。請確認 `drive_folder_id` 正確，且資料夾已「共用」給機器人(編輯者權限)。")
+        elif "File not found" in error_str:
+            st.error(f"❌ 上傳失敗：找不到資料夾 ID `{folder_id}`。請確認 ID 正確且機器人有權限。")
+        else:
+            st.error(f"上傳 Google Drive 失敗: {e}")
         return None
 
 DEFAULT_MENUS = {"範例店家": {"紅茶": {"單一規格": 30}}}
@@ -477,7 +491,6 @@ if st.button("送出訂單", type="primary"):
             sheet = spreadsheet.get_worksheet(0) 
             sheet.append_row(row_data)
             
-            # 清除訂單快取
             get_orders_from_sheet.clear()
             
             st.success(f"✅ {name} 點餐成功！")
@@ -498,14 +511,12 @@ if st.sidebar.checkbox("開啟結算功能"):
     try:
         if s_info:
             sheet_url = s_info.get("spreadsheet")
-            # 改用快取函式讀取資料
             all_values = get_orders_from_sheet(client, sheet_url)
             
             if len(all_values) > 1:
                 headers = all_values[0]
                 rows = all_values[1:]
                 
-                # 過濾空白標題
                 valid_indices = [i for i, h in enumerate(headers) if h.strip()]
                 
                 if not valid_indices:
@@ -519,7 +530,6 @@ if st.sidebar.checkbox("開啟結算功能"):
                     
                     df = pd.DataFrame(clean_rows, columns=clean_headers)
                     
-                    # 確保價格是數字
                     if '價格' in df.columns:
                         df['價格'] = pd.to_numeric(df['價格'], errors='coerce').fillna(0)
                     elif 'Price' in df.columns:
@@ -533,7 +543,6 @@ if st.sidebar.checkbox("開啟結算功能"):
                     st.markdown("### ✏️ 訂單管理與編輯")
                     st.caption("您可以直接點擊表格修改內容，或選取左側方框刪除列。修改完請務必按下方「儲存變更」。")
                     
-                    # 準備下拉選單的選項來源
                     all_stores = list(current_menus.keys())
                     all_items = set()
                     for m in current_menus.values():
@@ -547,42 +556,12 @@ if st.sidebar.checkbox("開啟結算功能"):
                         use_container_width=True,
                         key="order_editor",
                         column_config={
-                            "店家": st.column_config.SelectboxColumn(
-                                "店家",
-                                width="medium",
-                                options=all_stores,
-                                required=True,
-                            ),
-                            "品項": st.column_config.SelectboxColumn(
-                                "品項",
-                                width="medium",
-                                options=all_items,
-                                required=True,
-                            ),
-                            "大小": st.column_config.SelectboxColumn(
-                                "大小",
-                                width="small",
-                                options=all_sizes,
-                                required=True,
-                            ),
-                            "甜度": st.column_config.SelectboxColumn(
-                                "甜度",
-                                width="small",
-                                options=SUGAR_OPTS,
-                                required=True,
-                            ),
-                            "冰塊": st.column_config.SelectboxColumn(
-                                "冰塊",
-                                width="small",
-                                options=ICE_OPTS,
-                                required=True,
-                            ),
-                            "價格": st.column_config.NumberColumn(
-                                "價格",
-                                min_value=0,
-                                step=1,
-                                format="$%d",
-                            )
+                            "店家": st.column_config.SelectboxColumn("店家", options=all_stores, required=True),
+                            "品項": st.column_config.SelectboxColumn("品項", options=all_items, required=True),
+                            "大小": st.column_config.SelectboxColumn("大小", options=all_sizes, required=True),
+                            "甜度": st.column_config.SelectboxColumn("甜度", options=SUGAR_OPTS, required=True),
+                            "冰塊": st.column_config.SelectboxColumn("冰塊", options=ICE_OPTS, required=True),
+                            "價格": st.column_config.NumberColumn("價格", min_value=0, step=1)
                         }
                     )
                     
@@ -597,8 +576,8 @@ if st.sidebar.checkbox("開啟結算功能"):
                             
                             sheet.clear()
                             sheet.update(values=all_data)
-                            
                             get_orders_from_sheet.clear()
+                            
                             st.success("✅ 訂單已更新成功！")
                             st.rerun()
                         except Exception as e:
@@ -649,7 +628,7 @@ if st.sidebar.checkbox("開啟結算功能"):
                                 column_config={
                                     "扣款後餘額": st.column_config.NumberColumn(
                                         "扣款後餘額 (可編輯)",
-                                        help="修改數值將更新到儲值表",
+                                        help="修改此數值將會更新到儲值表",
                                         required=True,
                                         step=1
                                     ),
@@ -657,12 +636,12 @@ if st.sidebar.checkbox("開啟結算功能"):
                                 }
                             )
                             
-                            if st.button("💸 確認扣款並更新儲值表 (Update Deposit)", type="primary"):
+                            if st.button("💸 確認扣款並更新儲值表 (Update & Clear)", type="primary"):
                                 try:
                                     status_container = st.empty()
                                     status_container.info("⏳ 處理中：正在更新餘額與記錄交易...")
                                     
-                                    # 1. 準備資料
+                                    # 1. 更新資料準備
                                     update_map = {}
                                     changes_log = [] 
                                     for index, row in edited_balance_df.iterrows():
@@ -753,7 +732,6 @@ if st.sidebar.checkbox("開啟結算功能"):
                                         if drive_link:
                                             st.markdown(drive_msg)
                                         
-                                        # 不立即 rerun，讓使用者看到連結
                                         if st.button("🔄 重新整理頁面"):
                                             st.rerun()
                                         
