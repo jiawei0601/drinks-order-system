@@ -4,7 +4,7 @@ from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 
-# PDF 相關
+# PDF 相關套件
 import requests
 import os
 from reportlab.lib.pagesizes import A4
@@ -16,7 +16,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from io import BytesIO
 
-# Google Drive 相關
+# Google Drive 相關套件
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
@@ -47,6 +47,7 @@ def setup_chinese_font():
             for url in urls:
                 try:
                     response = requests.get(url, timeout=15)
+                    # 檢查內容是否為有效的二進位檔 (避免下載到 HTML 錯誤頁面)
                     if response.status_code == 200 and len(response.content) > 1000 and not response.content.startswith(b"<"):
                         with open(font_path, "wb") as f:
                             f.write(response.content)
@@ -63,12 +64,13 @@ def setup_chinese_font():
         pdfmetrics.registerFont(TTFont('ChineseFont', font_path))
         return 'ChineseFont'
     except Exception:
+        # 如果註冊失敗（例如檔案損壞），刪除檔案以便下次重試
         if os.path.exists(font_path): os.remove(font_path)
         return None
 
 # 初始化 Google Sheet 連線 (快取資源)
 @st.cache_resource
-def get_google_client():
+def get_google_sheet_data():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
@@ -83,7 +85,9 @@ def get_google_client():
             raise ValueError("找不到憑證！請確認 Secrets 設定。")
 
         # 修復 Private Key
-        private_key = s_info["private_key"].replace("\\n", "\n")
+        private_key = s_info["private_key"]
+        if "\\n" in private_key:
+            private_key = private_key.replace("\\n", "\n")
 
         # 建立憑證
         creds_dict = {
@@ -112,10 +116,14 @@ def get_google_client():
 
 # 讀取菜單 (快取 60s)
 @st.cache_data(ttl=60)
-def load_menu(_client, sheet_url):
+def load_menu_from_sheet(_client, sheet_url):
     try:
         spreadsheet = _client.open_by_url(sheet_url)
-        worksheet = spreadsheet.worksheet("菜單設定")
+        try:
+            worksheet = spreadsheet.worksheet("菜單設定")
+        except gspread.WorksheetNotFound:
+            return None, "找不到「菜單設定」分頁"
+        
         rows = worksheet.get_all_values()
         if len(rows) < 2: return None, "無資料"
         
@@ -128,10 +136,10 @@ def load_menu(_client, sheet_url):
             return -1
             
         idx_store = find_idx(["店家", "Store"])
-        idx_item = find_idx(["品項", "Item"])
-        idx_m = find_idx(["中杯", "M", "m"])
-        idx_l = find_idx(["大杯", "L", "l"])
-        idx_p = find_idx(["價格", "Price"])
+        idx_item = find_idx(["品項", "Item", "飲料"])
+        idx_m = find_idx(["中杯", "M", "m", "中"])
+        idx_l = find_idx(["大杯", "L", "l", "大"])
+        idx_price = find_idx(["價格", "Price", "單一規格"])
         
         if idx_store == -1 or idx_item == -1: return None, "欄位對應失敗"
 
@@ -149,7 +157,7 @@ def load_menu(_client, sheet_url):
             pm, pl, pp = None, None, None
             if idx_m != -1 and idx_m < len(row): pm = clean_p(row[idx_m])
             if idx_l != -1 and idx_l < len(row): pl = clean_p(row[idx_l])
-            if idx_p != -1 and idx_p < len(row): pp = clean_p(row[idx_p])
+            if idx_price != -1 and idx_price < len(row): pp = clean_p(row[idx_price])
             
             if pm: prices["中杯"] = pm
             if pl: prices["大杯"] = pl
@@ -164,7 +172,7 @@ def load_menu(_client, sheet_url):
 
 # 讀取加料 (快取 60s)
 @st.cache_data(ttl=60)
-def load_toppings(_client, sheet_url):
+def load_toppings_from_sheet(_client, sheet_url):
     try:
         sh = _client.open_by_url(sheet_url)
         ws = sh.worksheet("加料設定")
@@ -192,7 +200,7 @@ def load_toppings(_client, sheet_url):
 
 # 讀取存款 (快取 60s)
 @st.cache_data(ttl=60)
-def load_balances(_client, sheet_url):
+def load_balances_from_sheet(_client, sheet_url):
     try:
         sh = _client.open_by_url(sheet_url)
         ws = sh.worksheet("會員儲值")
@@ -201,13 +209,13 @@ def load_balances(_client, sheet_url):
         
         headers = [h.strip() for h in rows[0]]
         idx_name = -1
-        for k in ["姓名", "Name", "員工"]:
+        for k in ["姓名", "Name", "員工", "員工姓名"]:
             if k in headers: 
                 idx_name = headers.index(k)
                 break
         
         idx_bal = -1
-        for k in ["存款餘額", "餘額", "存款"]:
+        for k in ["存款餘額", "餘額", "存款", "Balance", "金額", "目前餘額"]:
             if k in headers:
                 idx_bal = headers.index(k)
                 break
@@ -228,7 +236,7 @@ def load_balances(_client, sheet_url):
 
 # 讀取訂單 (快取 5s - 高頻率)
 @st.cache_data(ttl=5)
-def get_orders(_client, sheet_url):
+def get_orders_from_sheet(_client, sheet_url):
     try:
         sh = _client.open_by_url(sheet_url)
         ws = sh.get_worksheet(0)
@@ -257,7 +265,7 @@ def log_transaction(_client, sheet_url, name, amount_change, new_balance, note="
         print(f"Log Error: {e}")
         return False
 
-# 產生 PDF (修正函式名稱以匹配呼叫)
+# 產生 PDF
 def generate_pdf_report(df, total_amount):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
@@ -268,7 +276,8 @@ def generate_pdf_report(df, total_amount):
     title_style = ParagraphStyle('Title', parent=styles['Title'], fontName=font_name, fontSize=20, leading=24)
     normal_style = ParagraphStyle('Normal', parent=styles['Normal'], fontName=font_name, fontSize=12, leading=16)
     
-    elements.append(Paragraph(f"飲料訂購結算單 ({datetime.now().strftime('%Y-%m-%d')})", title_style))
+    today = datetime.now().strftime("%Y-%m-%d")
+    elements.append(Paragraph(f"飲料訂購結算單 ({today})", title_style))
     elements.append(Spacer(1, 12))
     elements.append(Paragraph(f"今日總營業額：{total_amount} 元", normal_style))
     elements.append(Spacer(1, 12))
@@ -299,10 +308,20 @@ def generate_pdf_report(df, total_amount):
 # 上傳 Google Drive
 def upload_to_drive(pdf_bytes, filename, s_info):
     try:
-        # 1. 檢查 Folder ID
-        folder_id = st.secrets.get("drive_folder_id") or st.secrets.get("drive", {}).get("folder_id")
+        # 1. 檢查 Folder ID (增強版：支援多種 Secrets 位置)
+        # 優先找全域設定
+        folder_id = st.secrets.get("drive_folder_id")
+        
+        # 其次找 [drive] 區塊
         if not folder_id:
-            st.error("❌ 上傳失敗：未設定 `drive_folder_id`。")
+            folder_id = st.secrets.get("drive", {}).get("folder_id")
+            
+        # 最後找看看是不是不小心貼在 [connections.gsheets] (即 s_info) 裡面了
+        if not folder_id and isinstance(s_info, dict):
+            folder_id = s_info.get("drive_folder_id")
+            
+        if not folder_id:
+            st.error("❌ 上傳失敗：未設定 `drive_folder_id`。請去 Streamlit Cloud 的 Secrets 補上資料夾 ID。")
             return None
 
         # 2. 重建憑證
@@ -319,18 +338,27 @@ def upload_to_drive(pdf_bytes, filename, s_info):
             "auth_provider_x509_cert_url": s_info.get("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs"),
             "client_x509_cert_url": s_info["client_x509_cert_url"]
         }
-        creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/drive'])
+        scopes = ['https://www.googleapis.com/auth/drive']
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        
+        # 3. 建立 Drive Service
         service = build('drive', 'v3', credentials=creds)
         
-        # 3. 上傳
-        file_metadata = {'name': filename, 'parents': [folder_id]}
+        file_metadata = {
+            'name': filename,
+            'parents': [folder_id] 
+        }
+        
         media = MediaIoBaseUpload(pdf_bytes, mimetype='application/pdf', resumable=True)
+        
+        # 4. 執行上傳 (supportsAllDrives=True 支援共用雲端硬碟)
         file = service.files().create(
             body=file_metadata, 
             media_body=media, 
             fields='id, webViewLink',
             supportsAllDrives=True
         ).execute()
+        
         return file.get('webViewLink')
         
     except Exception as e:
@@ -338,7 +366,7 @@ def upload_to_drive(pdf_bytes, filename, s_info):
         if "storageQuotaExceeded" in error_str:
             st.error("❌ 上傳失敗：機器人無儲存空間，請確認資料夾ID正確並已共用(編輯者)。")
         elif "File not found" in error_str:
-            st.error("❌ 上傳失敗：找不到資料夾ID，請檢查 Secrets。")
+            st.error(f"❌ 上傳失敗：找不到資料夾 ID `{folder_id}`。請確認 ID 正確且機器人有權限。")
         else:
             st.error(f"上傳 Google Drive 失敗: {e}")
         return None
@@ -348,18 +376,18 @@ def upload_to_drive(pdf_bytes, filename, s_info):
 # ==========================================
 
 # 4-1. 初始化與載入資料
-client, s_info = get_google_client()
+client, s_info = get_google_sheet_data()
 sheet_url = s_info.get("spreadsheet")
 
 current_menus = DEFAULT_MENUS
 all_toppings = {}
 
 if sheet_url:
-    menus, err = load_menu(client, sheet_url)
+    menus, err = load_menu_from_sheet(client, sheet_url)
     if menus: current_menus = menus
     else: st.sidebar.warning(f"⚠️ 菜單讀取：{err}")
     
-    all_toppings = load_toppings(client, sheet_url)
+    all_toppings = load_toppings_from_sheet(client, sheet_url)
 else:
     st.error("❌ 請在 Secrets 設定 Spreadsheet 網址")
     st.stop()
@@ -428,7 +456,7 @@ if st.button("送出訂單", type="primary", use_container_width=True):
             ws = sh.get_worksheet(0)
             ws.append_row(row)
             
-            get_orders.clear() # 清快取
+            get_orders_from_sheet.clear() # 清快取
             st.success(f"✅ {user_name} 點餐成功！")
             st.balloons()
         except Exception as e:
@@ -442,7 +470,7 @@ if admin_mode:
     st.header("👮‍♂️ 管理員專區")
     
     # 讀取訂單
-    raw_data = get_orders(client, sheet_url)
+    raw_data = get_orders_from_sheet(client, sheet_url)
     
     if len(raw_data) > 1:
         headers = raw_data[0]
@@ -532,7 +560,7 @@ if admin_mode:
                     ws.clear()
                     ws.update(values=[new_headers] + new_vals)
                     
-                    get_orders.clear()
+                    get_orders_from_sheet.clear()
                     st.success("✅ 訂單更新成功！")
                     st.rerun()
                 except Exception as e:
@@ -542,7 +570,7 @@ if admin_mode:
             st.divider()
             st.subheader("💰 餘額扣款與結算")
             
-            balances = load_balances(client, sheet_url)
+            balances = load_balances_from_sheet(client, sheet_url)
             
             if balances is None:
                 st.warning("請先建立「會員儲值」分頁以使用扣款功能")
@@ -600,10 +628,10 @@ if admin_mode:
                             h_bal = bal_rows[0]
                             try:
                                 i_n = -1
-                                for k in ["姓名", "Name"]: 
+                                for k in ["姓名", "Name", "員工", "員工姓名"]: 
                                     if k in h_bal: i_n = h_bal.index(k)
                                 i_b = -1
-                                for k in ["存款餘額", "餘額"]: 
+                                for k in ["存款餘額", "餘額", "存款", "Balance", "金額", "目前餘額"]: 
                                     if k in h_bal: i_b = h_bal.index(k)
                             except: i_n, i_b = -1, -1
                             
@@ -643,8 +671,8 @@ if admin_mode:
                                 ws_ord.clear()
                                 ws_ord.append_row(['時間', '店家', '姓名', '品項', '大小', '加料', '價格', '甜度', '冰塊', '備註'])
                                 
-                                load_balances.clear()
-                                get_orders.clear()
+                                load_balances_from_sheet.clear()
+                                get_orders_from_sheet.clear()
                                 
                                 msg = f"✅ 結算完成！[PDF 下載]({link})" if link else "✅ 結算完成！(PDF 上傳失敗)"
                                 status_box.markdown(msg)
@@ -672,7 +700,7 @@ if admin_mode:
 # ==========================================
 st.divider()
 st.subheader("📊 今日訂單列表")
-data_disp = get_orders(client, sheet_url)
+data_disp = get_orders_from_sheet(client, sheet_url)
 if len(data_disp) > 1:
     h = data_disp[0]
     r = data_disp[1:]
@@ -683,26 +711,3 @@ if len(data_disp) > 1:
         st.dataframe(pd.DataFrame(c_r, columns=c_h), use_container_width=True)
 else:
     st.info("尚無訂單")
-# 上傳 Google Drive
-def upload_to_drive(pdf_bytes, filename, s_info):
-    try:
-        # 1. 檢查 Folder ID (增強版：支援多種 Secrets 位置)
-        # 優先找全域設定
-        folder_id = st.secrets.get("drive_folder_id")
-        
-        # 其次找 [drive] 區塊
-        if not folder_id:
-            folder_id = st.secrets.get("drive", {}).get("folder_id")
-            
-        # 最後找看看是不是不小心貼在 [connections.gsheets] (即 s_info) 裡面了
-        if not folder_id and isinstance(s_info, dict):
-            folder_id = s_info.get("drive_folder_id")
-            
-        if not folder_id:
-            st.error("❌ 上傳失敗：未設定 `drive_folder_id`。請去 Streamlit Cloud 的 Secrets 補上資料夾 ID。")
-            return None
-
-        # 2. 重建憑證
-        private_key = s_info["private_key"].replace("\\n", "\n")
-        creds_dict = {
-            "type": s_info["type"],
